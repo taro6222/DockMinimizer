@@ -69,6 +69,11 @@ import PackageDescription
 let package = Package(
     name: "DockMinimizer",
     platforms: [.macOS(.v14)],
+    products: [
+        // bundle.sh 가 `swift build --product DockMinimizer` 로 참조하므로 명시한다.
+        .executable(name: "DockMinimizer", targets: ["DockMinimizer"]),
+        .executable(name: "DockProbe", targets: ["DockProbe"]),
+    ],
     targets: [
         .target(name: "DockMinimizerCore"),
         .executableTarget(name: "DockMinimizer", dependencies: ["DockMinimizerCore"]),
@@ -356,21 +361,37 @@ Expected: `아이콘: <앱 이름> frame=...`이 출력된다.
 
 - [ ] **Step 4: Plan A / Plan B 판정**
 
-임의의 앱(예: 미리 알림)을 활성화한 상태에서 그 앱의 Dock 아이콘을 클릭한다.
+**판정의 핵심은 "윈도우가 전부 보이는 앱"이 아니라 "윈도우가 이미 최소화된 앱"이다.** 리슨 전용 탭에서는 클릭이 Dock에 그대로 전달되므로, 그 상태에서 Dock이 윈도우를 복원한다면 우리의 비동기 최소화와 Dock의 복원이 서로 경쟁하는 플립플롭이 생긴다. 아래 세 가지 상태를 모두 확인해야 판정이 성립한다.
 
-관찰할 것: **화면에서 아무 일도 일어나지 않는가?**
-- 아무 일도 없다 → **Plan A**. 리슨 전용 탭으로 충분하다
-- 윈도우가 앞으로 나오거나 다른 동작이 있다 → **Plan B**. 액티브 탭으로 클릭을 삼켜야 한다
+메모 앱으로 다음을 각각 수행하고 화면에서 무슨 일이 일어나는지 findings 문서에 기록한다.
 
-- [ ] **Step 5: Dock 확대 검증**
+| # | 상태 | 만드는 방법 | 관찰할 것 |
+|---|---|---|---|
+| 1 | 모든 윈도우가 보임, 프론트모스트 | 메모를 활성화 | 아무 일도 없는가 |
+| 2 | **모든 윈도우가 최소화됨, 프론트모스트** | 윈도우 하나만 열고 ⌘M, 메모가 여전히 프론트모스트인지 확인 | **Dock이 윈도우를 복원하는가** |
+| 3 | 일부만 최소화됨, 프론트모스트 | 윈도우 2개를 열고 하나만 ⌘M | Dock이 최소화된 것을 복원하는가 |
 
-시스템 설정 > 데스크탑 및 Dock 에서 **확대(magnification)를 켠다.** watch 모드를 다시 실행하고 아이콘 위에 마우스를 올린 상태로 클릭한다.
+판정:
 
-관찰할 것: 확대된 상태에서도 올바른 아이콘이 매칭되는가?
-- 매칭된다 → AX 프레임이 확대를 반영한다. 캐시가 틀리게 되므로 **아이콘 프레임 캐시 갱신 주기를 짧게 하거나, 확대 상태를 별도 처리해야 한다**
-- 확대를 꺼도 켜도 같은 프레임이 나온다 → 정적 레이아웃 기준이므로 캐시 전략이 그대로 통한다
+- 1·2·3 모두에서 아무 일도 일어나지 않는다 → **Plan A**. 리슨 전용 탭으로 충분하다
+- 2 또는 3에서 Dock이 복원한다 → **Plan B**. 액티브 탭으로 `.minimize` 판정 시 클릭을 삼켜야 한다. 그렇지 않으면 우리가 최소화하는 동안 Dock이 복원해 화면이 깜빡인다
+- 1에서 윈도우가 앞으로 나오는 등의 동작이 있다 → **Plan B**
 
-결과를 findings 문서에 기록한다. 검증 후 확대 설정은 원래대로 되돌린다.
+- [ ] **Step 5: Dock 확대 검증 — 이 계획에서 가장 위험한 미지수**
+
+AX 프레임이 확대를 실시간 반영한다면 1초 주기 캐시는 "약간 낡은" 것이 아니라 **매 클릭마다 틀린다.** 그렇다고 콜백에서 AX를 조회할 수도 없다(그것이 이 프로젝트의 최우선 금지 사항이다). 그래서 어느 쪽인지에 따라 대응이 완전히 달라진다.
+
+판별 방법: watch 모드를 실행한 상태에서, 시스템 설정 > 데스크탑 및 Dock 에서 **확대를 켜고** 아래 두 값을 비교한다.
+
+1. 커서를 Dock에서 멀리 둔 상태에서 `swift run DockProbe`로 특정 아이콘의 frame을 기록
+2. watch 모드에서 그 아이콘 위에 커서를 올린 채 클릭했을 때 출력되는 frame을 기록
+
+- **Case A — 두 frame이 다르다 (AX가 확대를 실시간 반영)**
+  → 캐시 갱신을 커서 위치에 연동한다. 이벤트 탭 마스크에 `mouseMoved`를 추가하되 **콜백은 "커서가 Dock 영역 안에 있다"는 타임스탬프만 기록**하고 AX는 건드리지 않는다. `DockIndex`는 그 타임스탬프가 최근이면 갱신 주기를 30ms로 올리고, 아니면 1초로 되돌린다. 클릭 시점의 캐시가 30ms 이내가 되어 확대 상태에서도 정확해진다.
+- **Case B — 두 frame이 같다 (AX가 정적 레이아웃 기준)**
+  → 확대가 켜지면 아이콘이 시각적으로 퍼지므로 사용자가 클릭한 좌표와 정적 프레임이 어긋나 오탐이 난다. 확대가 켜져 있는 동안에는 기능을 끈다. `UserDefaults(suiteName: "com.apple.dock")?.bool(forKey: "magnification")`으로 감지하고, 메뉴바에 "Dock 확대가 켜져 있어 일시 중지됨"을 표시한다.
+
+어느 Case인지 findings 문서에 명시한다. Task 10이 이 결과를 읽는다. 검증 후 확대 설정은 원래대로 되돌린다.
 
 - [ ] **Step 6: Dock 배치 변형 검증**
 
@@ -390,7 +411,8 @@ findings 문서에 다음 4가지 답이 모두 적혀 있어야 다음 Phase로
 1. AXList 개수와 순회 방법
 2. bundleID를 얻는 방법 (`AXURL` 또는 교차 조회)
 3. 좌표 변환식 (없으면 "그대로 사용")
-4. Plan A / Plan B 판정과 확대 처리 방침
+4. Plan A / Plan B 판정 — Step 4의 상태 1·2·3 각각의 관찰 결과와 함께
+5. Dock 확대 Case A / Case B 판정
 
 ---
 
@@ -1310,7 +1332,9 @@ git commit -m "feat: AX API 래퍼"
 
 ## Task 10: DockIndex 캐시
 
-**전제:** Task 1~2의 findings 문서를 먼저 읽는다. AXList 순회 방법, bundleID 획득 방법, 좌표 변환식이 거기 적혀 있다. 아래 코드는 "AXList를 재귀로 전부 수집하고, `AXURL`에서 bundleID를 얻으며, 좌표 변환이 필요 없다"는 가정으로 작성되었다. findings가 다르면 해당 부분만 고친다.
+**전제:** Task 1~2의 findings 문서를 먼저 읽는다. 아래 코드는 "AXList를 재귀로 전부 수집하고, `AXURL`에서 bundleID를 얻으며, 좌표 변환이 필요 없고, Dock 확대는 **Case B**(AX 프레임이 정적)"라는 가정으로 작성되었다.
+
+**findings가 Case A(AX 프레임이 확대를 실시간 반영)라면 Step 4를 반드시 수행한다.** 그 경우 1초 주기 캐시는 확대가 켜진 동안 매 클릭마다 틀리므로, 캐시 설계 자체를 바꿔야 한다. 이는 부분 수정이 아니라 Task 10과 Task 13에 걸친 변경이다.
 
 **Files:**
 - Create: `Sources/DockMinimizer/DockIndex.swift`
@@ -1462,7 +1486,133 @@ final class DockIndex: @unchecked Sendable {
 Run: `swift build`
 Expected: `Build complete!`
 
-- [ ] **Step 3: 커밋**
+- [ ] **Step 3: Case B라면 확대 감지와 일시 중지 추가**
+
+findings가 Case B(AX 프레임이 정적)라면, 확대가 켜진 동안에는 히트테스트가 어긋나므로 기능을 끈다. `DockIndex`에 다음을 추가한다.
+
+```swift
+    /// Dock 확대가 켜져 있는가. Case B에서는 확대 중에 히트테스트가 어긋나므로
+    /// 기능을 일시 중지하는 근거로 쓴다.
+    static var isDockMagnificationEnabled: Bool {
+        UserDefaults(suiteName: "com.apple.dock")?.bool(forKey: "magnification") ?? false
+    }
+```
+
+그리고 `buildSnapshot()`의 맨 앞에 다음을 넣어, 확대 중에는 빈 스냅샷을 반환해 `ClickRouter`가 자연히 `.ignore`를 내도록 한다.
+
+```swift
+        guard !Self.isDockMagnificationEnabled else { return .empty }
+```
+
+메뉴바 표시는 Task 17 Step 1의 `menuWillOpen`에서 `permissionItem.title`을 정할 때 다음 분기를 추가한다.
+
+```swift
+        if DockIndex.isDockMagnificationEnabled {
+            permissionItem.title = "Dock 확대가 켜져 있어 일시 중지됨"
+        } else if permissions.isTrusted {
+            permissionItem.title = "접근성 권한: 정상"
+        } else {
+            permissionItem.title = "접근성 권한 없음 — 설정에서 허용 필요"
+        }
+```
+
+- [ ] **Step 4: Case A라면 커서 연동 갱신으로 교체**
+
+findings가 Case A(AX 프레임이 실시간 확대 반영)라면, 고정 1초 주기로는 확대 상태를 따라갈 수 없다. 커서가 Dock 영역에 있을 때만 갱신 주기를 올린다.
+
+`DockIndex`에 다음을 추가한다.
+
+```swift
+    /// 커서가 Dock 영역 안에 있다고 마지막으로 보고된 시각(uptime 나노초).
+    /// EventTapController가 mouseMoved 콜백에서 갱신한다. 콜백은 이 값을 쓰기만 하고
+    /// AX는 건드리지 않으므로 콜백 예산을 넘지 않는다.
+    private let cursorInDockAt = OSAllocatedUnfairLock(initialState: UInt64(0))
+
+    /// Dock 영역(가장 최근 스냅샷의 아이콘들을 감싸는 사각형)을 조금 넉넉히 잡은 값.
+    var dockRegion: CGRect {
+        let items = snapshot.items
+        guard !items.isEmpty else { return .null }
+        return items.dropFirst()
+            .reduce(items[0].frame) { $0.union($1.frame) }
+            .insetBy(dx: -40, dy: -40)
+    }
+
+    func noteCursorInDock() {
+        cursorInDockAt.withLock { $0 = DispatchTime.now().uptimeNanoseconds }
+    }
+
+    private var cursorRecentlyInDock: Bool {
+        let last = cursorInDockAt.withLock { $0 }
+        guard last > 0 else { return false }
+        return DispatchTime.now().uptimeNanoseconds - last < 300_000_000  // 300ms
+    }
+```
+
+`startTimer()`의 주기를 30ms로 바꾸고, 커서가 Dock 근처에 없으면 대부분의 틱을 건너뛴다.
+
+```swift
+    private func startTimer() {
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + 0.03, repeating: 0.03)
+        var tickCount = 0
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            tickCount += 1
+            // 커서가 Dock 근처면 매 틱(30ms), 아니면 33틱마다(약 1초) 갱신한다.
+            guard self.cursorRecentlyInDock || tickCount % 33 == 0 else { return }
+            let fresh = self.buildSnapshot()
+            self.storage.withLock { $0 = fresh }
+        }
+        timer.resume()
+        refreshTimer = timer
+    }
+```
+
+`EventTapController`의 마스크에 `mouseMoved`를 추가하고, 콜백 최상단에서 좌표만 확인해 보고한다. Task 13 Step 1의 코드에 다음을 반영한다.
+
+`installTap()`의 마스크:
+
+```swift
+        let mask = CGEventMask(
+            (1 << CGEventType.leftMouseDown.rawValue) |
+            (1 << CGEventType.leftMouseUp.rawValue) |
+            (1 << CGEventType.mouseMoved.rawValue)
+        )
+```
+
+`EventTapController`에 커서 보고용 콜백을 추가한다.
+
+```swift
+    /// 커서가 Dock 영역 안에 있을 때 호출된다. 반드시 AX 호출 없이 즉시 반환해야 한다.
+    typealias CursorReporter = (CGPoint) -> Void
+```
+
+`init`에 `reportCursor: @escaping CursorReporter` 파라미터를 추가해 저장하고, `handle`의 `type == .tapDisabled...` 분기 바로 다음에 넣는다.
+
+```swift
+        if type == .mouseMoved {
+            reportCursor(event.location)
+            return Unmanaged.passUnretained(event)
+        }
+```
+
+`Coordinator.start()`에서 이 콜백을 연결한다.
+
+```swift
+            reportCursor: { [weak self] point in
+                guard let self else { return }
+                if self.dockIndex.dockRegion.contains(point) {
+                    self.dockIndex.noteCursorInDock()
+                }
+            },
+```
+
+- [ ] **Step 5: 빌드 확인**
+
+Run: `swift build`
+Expected: `Build complete!`
+
+- [ ] **Step 6: 커밋**
 
 ```bash
 git add -A
@@ -2115,8 +2265,11 @@ final class PermissionsManager: ObservableObject {
 
 `Sources/DockMinimizer/AppDelegate.swift`를 다음으로 교체한다.
 
+권한은 앱 실행 후에 부여되는 것이 정상 경로다. README의 설치 순서 자체가 "설치 → 실행 → 시스템 설정에서 허용"이므로, `isTrusted`가 false→true로 바뀌는 순간 Coordinator를 시작해야 한다. 이 구독이 없으면 앱이 켜져 있는데 아무 일도 하지 않고, 재실행해야만 동작하게 된다. 반대 방향(권한 회수)도 구독해야 죽은 탭을 붙들고 있지 않는다.
+
 ```swift
 import AppKit
+import Combine
 import DockMinimizerCore
 
 @MainActor
@@ -2125,10 +2278,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let permissions = PermissionsManager()
     private(set) var coordinator: Coordinator?
     private var menuBar: MenuBarController?
+    private var permissionSubscription: AnyCancellable?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        permissions.startMonitoring()
-
         let coordinator = Coordinator(settings: settings)
         self.coordinator = coordinator
 
@@ -2138,19 +2290,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             coordinator: coordinator
         )
 
-        if permissions.isTrusted {
-            coordinator.start()
-        } else {
-            permissions.requestAccess()
-        }
+        // 권한 상태 전환을 구독한다. startMonitoring 보다 먼저 구독해야
+        // 초기 상태 변화를 놓치지 않는다.
+        permissionSubscription = permissions.$isTrusted
+            .removeDuplicates()
+            .sink { [weak self] trusted in
+                guard let self else { return }
+                if trusted {
+                    self.coordinator?.start()
+                } else {
+                    self.coordinator?.stop()
+                    self.permissions.requestAccess()
+                }
+            }
+
+        permissions.startMonitoring()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        permissionSubscription = nil
         coordinator?.stop()
         permissions.stopMonitoring()
     }
 }
 ```
+
+`Coordinator.start()`와 `stop()`은 `isRunning` 가드가 있으므로 중복 호출이 안전하다. `@Published`는 구독 즉시 현재 값을 내보내므로, 이미 권한이 있는 상태로 실행되면 곧바로 `start()`가 호출된다.
 
 `MenuBarController`의 시그니처가 바뀌었으므로 Task 16까지는 빌드가 실패한다. 두 작업을 연속으로 진행한다.
 
@@ -2175,6 +2340,8 @@ import SwiftUI
 final class SettingsModel: ObservableObject {
     @Published var isEnabled: Bool {
         didSet {
+            // reloadFromSettings가 값을 밀어 넣을 때는 되쓰지 않는다.
+            guard !isSyncing else { return }
             settings.isEnabled = isEnabled
             coordinator.settingsDidChange()
         }
@@ -2184,6 +2351,7 @@ final class SettingsModel: ObservableObject {
     let settings: Settings
     let permissions: PermissionsManager
     private let coordinator: Coordinator
+    private var isSyncing = false
 
     init(settings: Settings, permissions: PermissionsManager, coordinator: Coordinator) {
         self.settings = settings
@@ -2191,6 +2359,15 @@ final class SettingsModel: ObservableObject {
         self.coordinator = coordinator
         self.isEnabled = settings.isEnabled
         self.exclusions = settings.userExcludedBundleIDs.sorted()
+    }
+
+    /// 메뉴바에서 활성화를 토글하면 이 모델은 모르므로, 창을 열 때마다 실제 설정을 다시 읽는다.
+    /// `Settings`가 유일한 진실이고 이 모델은 그 사본이다.
+    func reloadFromSettings() {
+        isSyncing = true
+        isEnabled = settings.isEnabled
+        isSyncing = false
+        exclusions = settings.userExcludedBundleIDs.sorted()
     }
 
     func addExclusionViaPanel() {
@@ -2214,7 +2391,7 @@ final class SettingsModel: ObservableObject {
     }
 
     private func reload() {
-        exclusions = settings.userExcludedBundleIDs.sorted()
+        reloadFromSettings()
         coordinator.settingsDidChange()
     }
 }
@@ -2295,6 +2472,8 @@ final class SettingsWindowController {
     }
 
     func show() {
+        // 메뉴바에서 바뀐 값이 있을 수 있으므로 열 때마다 실제 설정을 다시 읽는다.
+        model.reloadFromSettings()
         if window == nil {
             let hosting = NSHostingController(
                 rootView: SettingsView(model: model, permissions: permissions)
@@ -2449,14 +2628,26 @@ Run: `./Scripts/install.sh`
 
 메뉴에서 `설정...`을 연다. 창이 앞으로 나오고, `추가...`로 앱을 하나 제외에 넣은 뒤 그 앱에서 Dock 클릭이 더 이상 최소화하지 않는지 확인한다. 그 후 제거한다.
 
-- [ ] **Step 5: 로그인 시 시작 확인**
+- [ ] **Step 5: 메뉴와 설정 창의 동기화 확인**
+
+설정 창을 열어 둔 채 메뉴바에서 `활성화`를 토글한다. 설정 창을 닫았다가 다시 연다.
+
+Expected: 설정 창의 체크박스가 메뉴바에서 바꾼 값과 일치한다.
+
+- [ ] **Step 6: 권한 부여 시점 동작 확인 — 문서화된 설치 경로**
+
+시스템 설정 > 손쉬운 사용에서 DockMinimizer 권한을 **끈다**. Dock 클릭 최소화가 멈추는지 확인한다. 다시 **켠다**.
+
+Expected: **앱을 재실행하지 않고도** Dock 클릭 최소화가 다시 동작한다. 재실행해야만 동작한다면 `AppDelegate`의 `permissionSubscription`이 연결되지 않은 것이다.
+
+- [ ] **Step 7: 로그인 시 시작 확인**
 
 메뉴에서 `로그인 시 시작`을 켠다.
 
 Run: `sfltool dumpbtm 2>/dev/null | grep -A2 dockminimizer || echo "sfltool 사용 불가 — 시스템 설정 > 일반 > 로그인 항목에서 육안 확인"`
 Expected: DockMinimizer가 로그인 항목에 등록되어 있다.
 
-- [ ] **Step 6: 커밋**
+- [ ] **Step 8: 커밋**
 
 ```bash
 git add -A
@@ -2513,7 +2704,8 @@ git commit -m "feat: 권한 관리, 설정 창, 메뉴바 완성"
 
 ## 시스템 이벤트
 - [ ] `killall Dock` 후 클릭 — 재인덱싱되어 계속 동작한다
-- [ ] 접근성 권한을 껐다 켜기 — 메뉴바에 상태가 반영된다
+- [ ] 접근성 권한을 껐다 켜기 — 메뉴바 상태가 반영되고, 재실행 없이 동작이 재개된다
+- [ ] Dock 확대 켜기/끄기 — Phase 0에서 정한 Case A/Case B 방침대로 동작한다
 - [ ] 디스플레이 해상도 변경 후 클릭
 - [ ] `./Scripts/install.sh` 재실행 — 접근성 권한이 유지된다
 - [ ] 30분 이상 실행 후에도 동작 유지 (탭이 죽지 않는다)
