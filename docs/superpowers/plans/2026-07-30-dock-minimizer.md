@@ -1,0 +1,2631 @@
+# DockMinimizer Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** 프론트모스트 앱의 Dock 아이콘을 클릭하면 그 앱의 윈도우를 최소화하는 macOS 메뉴바 에이전트를 만든다.
+
+**Architecture:** `CGEventTap`으로 마우스 클릭을 관찰하고, Dock 프로세스의 접근성(AX) 트리에서 미리 캐싱해 둔 아이콘 프레임과 대조해 어느 아이콘이 눌렸는지 역산한다. 이벤트 탭 콜백은 캐시 읽기와 기하 비교만 수행하고 AX 호출을 일절 하지 않는다 — 콜백이 느리면 macOS가 탭을 조용히 죽이기 때문이다. 판정 로직은 `DockMinimizerCore`의 순수 함수 `ClickRouter.decide`로 분리해 전부 단위 테스트한다.
+
+**Tech Stack:** Swift 6.3, SwiftPM, AppKit, SwiftUI(설정 창), ApplicationServices(AX), CoreGraphics(이벤트 탭), ServiceManagement(로그인 시작), Swift Testing
+
+**설계 문서:** `docs/superpowers/specs/2026-07-30-dock-click-minimize-design.md`
+
+---
+
+## 파일 구조
+
+| 경로 | 책임 |
+|---|---|
+| `Package.swift` | SPM 매니페스트. 타깃 4개 |
+| `Sources/DockMinimizerCore/DockSnapshot.swift` | `DockItem`, `DockSnapshot` 값 타입과 히트테스트 |
+| `Sources/DockMinimizerCore/AppState.swift` | `AppState` 값 타입 |
+| `Sources/DockMinimizerCore/ClickRouter.swift` | `RouterInput`, `Decision`, 순수 판정 함수 |
+| `Sources/DockMinimizerCore/Settings.swift` | 설정 모델과 UserDefaults 영속화 |
+| `Sources/DockMinimizer/main.swift` | 앱 진입점 |
+| `Sources/DockMinimizer/AppDelegate.swift` | 수명 관리, 모듈 배선 |
+| `Sources/DockMinimizer/AXHelpers.swift` | AX 속성 조회 헬퍼 (얇은 래퍼) |
+| `Sources/DockMinimizer/DockIndex.swift` | Dock AX 트리 → `DockSnapshot` 캐시와 갱신 |
+| `Sources/DockMinimizer/AppStateCache.swift` | frontmost, 보이는 윈도우 여부, `minimizedByUs` |
+| `Sources/DockMinimizer/Minimizer.swift` | 대상 앱 윈도우 최소화 |
+| `Sources/DockMinimizer/EventTapController.swift` | 이벤트 탭 수명 관리와 복구 |
+| `Sources/DockMinimizer/Coordinator.swift` | 위 모듈들을 잇는 조립부 |
+| `Sources/DockMinimizer/PermissionsManager.swift` | 접근성 권한 확인·요청·감시 |
+| `Sources/DockMinimizer/MenuBarController.swift` | NSStatusItem과 메뉴 |
+| `Sources/DockMinimizer/SettingsWindow.swift` | 설정 창 (SwiftUI + NSHostingView) |
+| `Sources/DockProbe/main.swift` | Phase 0 스파이크 도구 |
+| `Tests/DockMinimizerCoreTests/*.swift` | 순수 로직 테스트 |
+| `Resources/Info.plist` | 번들 메타데이터 |
+| `Scripts/make-cert.sh` `bundle.sh` `install.sh` | 서명·빌드·설치 파이프라인 |
+
+---
+
+# Phase 0 — 스파이크 (게이트)
+
+**이 Phase의 결과가 Task 13과 Task 10의 구현을 결정한다. 여기서 나온 실측값 없이는 그 두 작업을 시작하지 않는다.**
+
+## Task 1: Dock AX 트리 실측
+
+**Files:**
+- Create: `Package.swift`
+- Create: `Sources/DockProbe/main.swift`
+- Create: `.gitignore`
+
+- [ ] **Step 1: `.gitignore` 작성**
+
+```gitignore
+.build/
+build/
+.DS_Store
+*.xcodeproj
+.swiftpm/
+```
+
+- [ ] **Step 2: `Package.swift` 작성**
+
+```swift
+// swift-tools-version: 6.0
+import PackageDescription
+
+let package = Package(
+    name: "DockMinimizer",
+    platforms: [.macOS(.v14)],
+    targets: [
+        .target(name: "DockMinimizerCore"),
+        .executableTarget(name: "DockMinimizer", dependencies: ["DockMinimizerCore"]),
+        .executableTarget(name: "DockProbe"),
+        .testTarget(name: "DockMinimizerCoreTests", dependencies: ["DockMinimizerCore"]),
+    ]
+)
+```
+
+- [ ] **Step 3: 빌드가 통과하도록 최소 스텁 생성**
+
+`Sources/DockMinimizerCore/Placeholder.swift`:
+
+```swift
+// Task 6에서 실제 타입으로 대체된다.
+enum Placeholder {}
+```
+
+`Sources/DockMinimizer/main.swift`:
+
+```swift
+// Task 5에서 실제 앱 진입점으로 대체된다.
+print("DockMinimizer stub")
+```
+
+`Tests/DockMinimizerCoreTests/PlaceholderTests.swift`:
+
+```swift
+import Testing
+
+@Test("스캐폴딩이 빌드된다")
+func scaffoldingBuilds() {
+    #expect(Bool(true))
+}
+```
+
+- [ ] **Step 4: `Sources/DockProbe/main.swift` 작성**
+
+```swift
+import AppKit
+import ApplicationServices
+
+// Dock의 접근성 트리를 덤프하는 스파이크 도구.
+// 사용법: DockProbe dump
+
+func attribute(_ element: AXUIElement, _ name: String) -> CFTypeRef? {
+    var value: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(element, name as CFString, &value) == .success else {
+        return nil
+    }
+    return value
+}
+
+func describe(_ element: AXUIElement, _ name: String) -> String {
+    guard let value = attribute(element, name) else { return "-" }
+    return "\(value)"
+}
+
+func children(_ element: AXUIElement) -> [AXUIElement] {
+    (attribute(element, kAXChildrenAttribute as String) as? [AXUIElement]) ?? []
+}
+
+func frame(_ element: AXUIElement) -> CGRect {
+    var point = CGPoint.zero
+    var size = CGSize.zero
+    if let raw = attribute(element, kAXPositionAttribute as String) {
+        AXValueGetValue(raw as! AXValue, .cgPoint, &point)
+    }
+    if let raw = attribute(element, kAXSizeAttribute as String) {
+        AXValueGetValue(raw as! AXValue, .cgSize, &size)
+    }
+    return CGRect(origin: point, size: size)
+}
+
+func attributeNames(_ element: AXUIElement) -> [String] {
+    var names: CFArray?
+    guard AXUIElementCopyAttributeNames(element, &names) == .success else { return [] }
+    return (names as? [String]) ?? []
+}
+
+/// AXList 역할을 가진 모든 엘리먼트를 깊이 우선으로 수집한다.
+/// Dock은 앱 / 최근 항목 / 휴지통을 별개의 리스트로 나눠 가질 수 있으므로 전부 찾아야 한다.
+func collectLists(_ element: AXUIElement, depth: Int = 0, into result: inout [AXUIElement]) {
+    if depth > 6 { return }
+    if describe(element, kAXRoleAttribute as String) == "AXList" {
+        result.append(element)
+    }
+    for child in children(element) {
+        collectLists(child, depth: depth + 1, into: &result)
+    }
+}
+
+func dumpTree(_ element: AXUIElement, depth: Int, maxDepth: Int) {
+    let pad = String(repeating: "  ", count: depth)
+    let kids = children(element)
+    let role = describe(element, kAXRoleAttribute as String)
+    let subrole = describe(element, kAXSubroleAttribute as String)
+    let title = describe(element, kAXTitleAttribute as String)
+    print("\(pad)role=\(role) subrole=\(subrole) title=\(title) frame=\(frame(element)) children=\(kids.count)")
+    guard depth < maxDepth else { return }
+    for child in kids {
+        dumpTree(child, depth: depth + 1, maxDepth: maxDepth)
+    }
+}
+
+// MARK: - 실행
+
+print("=== 권한 ===")
+print("AXIsProcessTrusted: \(AXIsProcessTrusted())")
+guard AXIsProcessTrusted() else {
+    print("접근성 권한이 없습니다. 이 프로세스를 실행한 앱(터미널 등)에")
+    print("시스템 설정 > 개인정보 보호 및 보안 > 손쉬운 사용 에서 권한을 부여한 뒤 다시 실행하세요.")
+    exit(1)
+}
+
+guard let dock = NSRunningApplication
+    .runningApplications(withBundleIdentifier: "com.apple.dock").first else {
+    print("Dock 프로세스를 찾을 수 없습니다.")
+    exit(1)
+}
+print("Dock pid: \(dock.processIdentifier)")
+
+let dockApp = AXUIElementCreateApplication(dock.processIdentifier)
+AXUIElementSetMessagingTimeout(dockApp, 1.0)
+
+print("\n=== 트리 (깊이 3) ===")
+dumpTree(dockApp, depth: 0, maxDepth: 3)
+
+print("\n=== 발견된 AXList ===")
+var lists: [AXUIElement] = []
+collectLists(dockApp, into: &lists)
+print("AXList 개수: \(lists.count)")
+
+for (index, list) in lists.enumerated() {
+    let items = children(list)
+    print("\n--- LIST[\(index)] frame=\(frame(list)) items=\(items.count)")
+    for item in items {
+        let title = describe(item, kAXTitleAttribute as String)
+        let subrole = describe(item, kAXSubroleAttribute as String)
+        let url = describe(item, "AXURL")
+        let running = describe(item, "AXIsApplicationRunning")
+        print("  title=\(title)")
+        print("    subrole=\(subrole) frame=\(frame(item))")
+        print("    AXURL=\(url) AXIsApplicationRunning=\(running)")
+        print("    attributes=\(attributeNames(item).joined(separator: ", "))")
+    }
+}
+
+print("\n=== 화면 ===")
+for screen in NSScreen.screens {
+    print("frame=\(screen.frame) visibleFrame=\(screen.visibleFrame)")
+}
+```
+
+- [ ] **Step 5: 빌드**
+
+Run: `swift build`
+Expected: `Build complete!`
+
+- [ ] **Step 6: 접근성 권한 부여**
+
+`DockProbe`는 터미널에서 실행되므로, 권한은 **터미널 앱**(또는 Claude Code를 실행 중인 앱)에 부여해야 한다.
+
+시스템 설정 > 개인정보 보호 및 보안 > 손쉬운 사용 에서 해당 앱을 추가하고 켠다. 이미 켜져 있다면 껐다 켠다.
+
+- [ ] **Step 7: 프로브 실행**
+
+Run: `swift run DockProbe 2>&1 | tee /tmp/dockprobe-dump.txt`
+Expected: `AXIsProcessTrusted: true`, 그리고 Dock 아이콘들의 title/frame/AXURL이 출력된다.
+
+`AXIsProcessTrusted: false`가 나오면 계층이 없어서가 아니라 권한이 없어서다. Step 6으로 돌아간다.
+
+- [ ] **Step 8: 실측 결과를 기록**
+
+다음 항목의 답을 `docs/superpowers/specs/2026-07-30-phase0-findings.md`에 표로 기록한다.
+
+1. `AXList`가 몇 개인가? 각각 무엇을 담고 있는가 (앱 / 최근 항목 / 휴지통)?
+2. dock item에 `AXURL`이 있는가? 값이 `.app` 번들 경로인가?
+3. `AXIsApplicationRunning` 같은 실행 상태 속성이 있는가? 없다면 `NSWorkspace.runningApplications`와 번들 경로로 교차 조회해야 한다.
+4. dock item의 `frame` y좌표가 화면 하단(예: 1000 근처)인가 상단(0 근처)인가? → 좌표 원점 확인
+
+- [ ] **Step 9: 커밋**
+
+```bash
+git add -A
+git commit -m "feat: Phase 0 Dock AX 프로브 도구 및 실측 결과"
+```
+
+## Task 2: 좌표계·클릭 동작·확대 실측
+
+**Files:**
+- Modify: `Sources/DockProbe/main.swift`
+- Modify: `docs/superpowers/specs/2026-07-30-phase0-findings.md`
+
+- [ ] **Step 1: 프로브에 `watch` 모드 추가**
+
+`Sources/DockProbe/main.swift`의 `// MARK: - 실행` 바로 앞에 다음을 삽입한다.
+
+```swift
+// MARK: - watch 모드
+
+/// 리슨 전용 이벤트 탭으로 클릭을 관찰하고, 그 좌표가 어느 Dock 아이콘 프레임에
+/// 들어가는지 출력한다. 좌표계가 일치하는지, 그리고 Dock 기본 동작이 무엇인지 확인한다.
+final class ClickWatcher {
+    private var tap: CFMachPort?
+    private let dockApp: AXUIElement
+
+    init(dockApp: AXUIElement) {
+        self.dockApp = dockApp
+    }
+
+    func start() {
+        let mask = (1 << CGEventType.leftMouseDown.rawValue)
+        let callback: CGEventTapCallBack = { _, type, event, refcon in
+            guard let refcon else { return Unmanaged.passUnretained(event) }
+            let watcher = Unmanaged<ClickWatcher>.fromOpaque(refcon).takeUnretainedValue()
+            watcher.handle(type: type, event: event)
+            return Unmanaged.passUnretained(event)
+        }
+
+        guard let tap = CGEvent.tapCreate(
+            tap: .cgSessionEventTap,
+            place: .headInsertEventTap,
+            options: .listenOnly,
+            eventsOfInterest: CGEventMask(mask),
+            callback: callback,
+            userInfo: Unmanaged.passUnretained(self).toOpaque()
+        ) else {
+            print("이벤트 탭 생성 실패. 접근성 권한을 확인하세요.")
+            exit(1)
+        }
+        self.tap = tap
+        let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+        CFRunLoopAddSource(CFRunLoopGetCurrent(), source, .commonModes)
+        CGEvent.tapEnable(tap: tap, enable: true)
+        print("클릭을 관찰합니다. Dock 아이콘을 클릭해 보세요. 중지하려면 Ctrl-C.")
+    }
+
+    private func handle(type: CGEventType, event: CGEvent) {
+        guard type == .leftMouseDown else { return }
+        let point = event.location
+        var lists: [AXUIElement] = []
+        collectLists(dockApp, into: &lists)
+        var hit: String = "없음"
+        for list in lists {
+            for item in children(list) where frame(item).contains(point) {
+                hit = "\(describe(item, kAXTitleAttribute as String)) frame=\(frame(item))"
+            }
+        }
+        let front = NSWorkspace.shared.frontmostApplication?.localizedName ?? "-"
+        print("클릭 \(point) → 아이콘: \(hit) | 프론트모스트: \(front)")
+    }
+}
+```
+
+그리고 파일 맨 끝에 다음을 추가한다.
+
+```swift
+if CommandLine.arguments.contains("watch") {
+    let watcher = ClickWatcher(dockApp: dockApp)
+    watcher.start()
+    CFRunLoopRun()
+}
+```
+
+`dump` 출력이 매번 나오지 않도록, `=== 트리 (깊이 3) ===`부터 `=== 화면 ===` 블록 전체를 다음으로 감싼다.
+
+```swift
+if !CommandLine.arguments.contains("watch") {
+    // ... 기존 dump 출력 블록 ...
+}
+```
+
+- [ ] **Step 2: watch 모드 실행**
+
+Run: `swift run DockProbe watch`
+Expected: `클릭을 관찰합니다.`
+
+- [ ] **Step 3: 좌표계 검증**
+
+Dock의 아무 앱 아이콘이나 클릭한다.
+Expected: `아이콘: <앱 이름> frame=...`이 출력된다.
+
+`아이콘: 없음`이 계속 나오면 AX 좌표와 `CGEvent.location`의 원점이 다르다는 뜻이다. 그 경우 `frame(item)`의 y값과 클릭 좌표의 y값을 비교해 변환식을 찾아 findings 문서에 기록한다.
+
+- [ ] **Step 4: Plan A / Plan B 판정**
+
+임의의 앱(예: 미리 알림)을 활성화한 상태에서 그 앱의 Dock 아이콘을 클릭한다.
+
+관찰할 것: **화면에서 아무 일도 일어나지 않는가?**
+- 아무 일도 없다 → **Plan A**. 리슨 전용 탭으로 충분하다
+- 윈도우가 앞으로 나오거나 다른 동작이 있다 → **Plan B**. 액티브 탭으로 클릭을 삼켜야 한다
+
+- [ ] **Step 5: Dock 확대 검증**
+
+시스템 설정 > 데스크탑 및 Dock 에서 **확대(magnification)를 켠다.** watch 모드를 다시 실행하고 아이콘 위에 마우스를 올린 상태로 클릭한다.
+
+관찰할 것: 확대된 상태에서도 올바른 아이콘이 매칭되는가?
+- 매칭된다 → AX 프레임이 확대를 반영한다. 캐시가 틀리게 되므로 **아이콘 프레임 캐시 갱신 주기를 짧게 하거나, 확대 상태를 별도 처리해야 한다**
+- 확대를 꺼도 켜도 같은 프레임이 나온다 → 정적 레이아웃 기준이므로 캐시 전략이 그대로 통한다
+
+결과를 findings 문서에 기록한다. 검증 후 확대 설정은 원래대로 되돌린다.
+
+- [ ] **Step 6: Dock 배치 변형 검증**
+
+Dock 위치를 왼쪽으로 옮기고, 자동 숨김을 켜고 각각 watch 모드로 클릭이 올바르게 매칭되는지 확인한다. 결과를 기록하고 설정을 원복한다.
+
+- [ ] **Step 7: findings 문서 갱신 후 커밋**
+
+```bash
+git add -A
+git commit -m "feat: Phase 0 좌표계·클릭 동작·Dock 확대 실측"
+```
+
+- [ ] **Step 8: 게이트 확인**
+
+findings 문서에 다음 4가지 답이 모두 적혀 있어야 다음 Phase로 넘어간다.
+
+1. AXList 개수와 순회 방법
+2. bundleID를 얻는 방법 (`AXURL` 또는 교차 조회)
+3. 좌표 변환식 (없으면 "그대로 사용")
+4. Plan A / Plan B 판정과 확대 처리 방침
+
+---
+
+# Phase 1 — 스캐폴딩과 서명 파이프라인
+
+**로직보다 먼저 한다.** 접근성 권한은 코드 서명과 번들 ID에 묶이므로, 서명이 불안정하면 이후 모든 디버깅이 "권한이 날아간 것인지 코드가 틀린 것인지" 구분되지 않는다.
+
+## Task 3: Info.plist와 앱 번들 조립
+
+**Files:**
+- Create: `Resources/Info.plist`
+- Create: `Scripts/bundle.sh`
+
+- [ ] **Step 1: `Resources/Info.plist` 작성**
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>ko</string>
+    <key>CFBundleExecutable</key>
+    <string>DockMinimizer</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.changhun.dockminimizer</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>DockMinimizer</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSHumanReadableCopyright</key>
+    <string>Copyright © 2026 changhun</string>
+</dict>
+</plist>
+```
+
+`LSUIElement`가 `true`이므로 이 앱 자신은 Dock 아이콘을 갖지 않는다. 자기 자신을 최소화하는 사고가 구조적으로 불가능해진다.
+
+- [ ] **Step 2: `Scripts/bundle.sh` 작성**
+
+```bash
+#!/usr/bin/env bash
+# .app 번들을 조립하고 서명한다.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CERT_NAME="${DOCKMINIMIZER_CERT:-DockMinimizer Self Signed}"
+APP="$ROOT/build/DockMinimizer.app"
+
+echo "==> 릴리스 빌드"
+swift build -c release --package-path "$ROOT" --product DockMinimizer
+BIN_DIR="$(swift build -c release --package-path "$ROOT" --show-bin-path)"
+
+echo "==> 번들 조립"
+rm -rf "$APP"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+cp "$BIN_DIR/DockMinimizer" "$APP/Contents/MacOS/DockMinimizer"
+cp "$ROOT/Resources/Info.plist" "$APP/Contents/Info.plist"
+
+if security find-identity -v -p codesigning | grep -q "$CERT_NAME"; then
+    echo "==> 서명: $CERT_NAME"
+    codesign --force --sign "$CERT_NAME" "$APP"
+else
+    echo "경고: '$CERT_NAME' 인증서가 없습니다. Scripts/make-cert.sh 를 먼저 실행하세요."
+    echo "      임시로 ad-hoc 서명합니다. 재빌드 때마다 접근성 권한이 사라집니다."
+    codesign --force --sign - "$APP"
+fi
+
+codesign --verify --verbose=2 "$APP"
+echo "==> 완료: $APP"
+```
+
+- [ ] **Step 3: 실행 권한 부여 후 실행**
+
+Run: `chmod +x Scripts/bundle.sh && ./Scripts/bundle.sh`
+Expected: `==> 완료: .../build/DockMinimizer.app` (인증서 경고는 아직 정상)
+
+- [ ] **Step 4: 번들 구조 확인**
+
+Run: `find build/DockMinimizer.app -type f`
+Expected:
+```
+build/DockMinimizer.app/Contents/Info.plist
+build/DockMinimizer.app/Contents/MacOS/DockMinimizer
+build/DockMinimizer.app/Contents/_CodeSignature/CodeResources
+```
+
+- [ ] **Step 5: 커밋**
+
+```bash
+git add -A
+git commit -m "feat: Info.plist와 앱 번들 조립 스크립트"
+```
+
+## Task 4: 고정 코드서명 인증서
+
+**Files:**
+- Create: `Scripts/make-cert.sh`
+
+- [ ] **Step 1: `Scripts/make-cert.sh` 작성**
+
+```bash
+#!/usr/bin/env bash
+# 재빌드해도 접근성 권한이 유지되도록 고정 self-signed 코드서명 인증서를 만든다.
+# ad-hoc 서명(codesign -s -)은 빌드마다 cdhash가 바뀌어 TCC 권한이 사라진다.
+set -euo pipefail
+
+CERT_NAME="${DOCKMINIMIZER_CERT:-DockMinimizer Self Signed}"
+KEYCHAIN="$HOME/Library/Keychains/login.keychain-db"
+
+if security find-identity -v -p codesigning | grep -q "$CERT_NAME"; then
+    echo "이미 존재합니다: $CERT_NAME"
+    exit 0
+fi
+
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+echo "==> 자체 서명 인증서 생성"
+openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+    -keyout "$WORK/key.pem" -out "$WORK/cert.pem" \
+    -subj "/CN=$CERT_NAME" \
+    -addext "basicConstraints=critical,CA:false" \
+    -addext "keyUsage=critical,digitalSignature" \
+    -addext "extendedKeyUsage=critical,codeSigning"
+
+openssl pkcs12 -export -out "$WORK/identity.p12" \
+    -inkey "$WORK/key.pem" -in "$WORK/cert.pem" \
+    -name "$CERT_NAME" -passout pass:
+
+echo "==> 키체인에 가져오기 (키체인 암호 입력창이 뜰 수 있습니다)"
+security import "$WORK/identity.p12" -k "$KEYCHAIN" -P "" \
+    -T /usr/bin/codesign -T /usr/bin/security
+
+echo "==> 코드서명 신뢰 설정 (암호 입력창이 뜰 수 있습니다)"
+security add-trusted-cert -r trustRoot -p codeSign -k "$KEYCHAIN" "$WORK/cert.pem"
+
+echo "==> 확인"
+security find-identity -v -p codesigning | grep "$CERT_NAME"
+echo "완료."
+```
+
+- [ ] **Step 2: 실행**
+
+Run: `chmod +x Scripts/make-cert.sh && ./Scripts/make-cert.sh`
+Expected: 마지막 줄에 `1) <해시> "DockMinimizer Self Signed"` 형태로 인증서가 나열된다.
+
+키체인 암호 입력창이 뜨면 로그인 암호를 입력한다. 이는 1회성 단계다.
+
+- [ ] **Step 3: 실패 시 GUI 대안**
+
+`security find-identity`에 인증서가 나타나지 않으면 GUI로 만든다.
+
+키체인 접근 앱 실행 → 메뉴의 인증서 지원 > 인증서 생성 → 이름 `DockMinimizer Self Signed`, 신원 유형 `자체 서명 루트`, 인증서 유형 **`코드 서명`**, "기본값 무시" 체크 해제 → 생성. 그 후 Step 2의 확인 명령을 다시 실행한다.
+
+- [ ] **Step 4: 서명된 번들 재생성**
+
+Run: `./Scripts/bundle.sh`
+Expected: `==> 서명: DockMinimizer Self Signed` 가 출력되고 인증서 경고가 사라진다.
+
+- [ ] **Step 5: 서명 주체 확인**
+
+Run: `codesign -dv --verbose=4 build/DockMinimizer.app 2>&1 | grep -E 'Identifier|Authority'`
+Expected:
+```
+Identifier=com.changhun.dockminimizer
+Authority=DockMinimizer Self Signed
+```
+
+- [ ] **Step 6: 커밋**
+
+```bash
+git add -A
+git commit -m "feat: 고정 self-signed 코드서명 인증서 생성 스크립트"
+```
+
+## Task 5: 메뉴바 껍데기와 설치
+
+**Files:**
+- Modify: `Sources/DockMinimizer/main.swift`
+- Create: `Sources/DockMinimizer/AppDelegate.swift`
+- Create: `Sources/DockMinimizer/MenuBarController.swift`
+- Create: `Scripts/install.sh`
+
+- [ ] **Step 1: `Sources/DockMinimizer/MenuBarController.swift` 작성**
+
+```swift
+import AppKit
+
+/// 메뉴바 아이콘과 메뉴를 소유한다. Task 17에서 항목이 추가된다.
+@MainActor
+final class MenuBarController {
+    private let statusItem: NSStatusItem
+
+    init() {
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        statusItem.button?.image = NSImage(
+            systemSymbolName: "dock.arrow.down.rectangle",
+            accessibilityDescription: "DockMinimizer"
+        )
+        statusItem.menu = buildMenu()
+    }
+
+    private func buildMenu() -> NSMenu {
+        let menu = NSMenu()
+        let quit = NSMenuItem(
+            title: "종료",
+            action: #selector(NSApplication.terminate(_:)),
+            keyEquivalent: "q"
+        )
+        quit.target = NSApp
+        menu.addItem(quit)
+        return menu
+    }
+}
+```
+
+- [ ] **Step 2: `Sources/DockMinimizer/AppDelegate.swift` 작성**
+
+```swift
+import AppKit
+
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    private var menuBar: MenuBarController?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        menuBar = MenuBarController()
+    }
+}
+```
+
+- [ ] **Step 3: `Sources/DockMinimizer/main.swift` 교체**
+
+```swift
+import AppKit
+
+let app = NSApplication.shared
+let delegate = AppDelegate()
+app.delegate = delegate
+// LSUIElement와 짝을 이룬다. Dock 아이콘도 메뉴바 앱 메뉴도 갖지 않는다.
+app.setActivationPolicy(.accessory)
+app.run()
+```
+
+- [ ] **Step 4: `Scripts/install.sh` 작성**
+
+```bash
+#!/usr/bin/env bash
+# /Applications 고정 경로에 설치한다.
+# 경로가 바뀌면 접근성 권한이 사라지므로 항상 같은 경로를 쓴다.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DEST="/Applications/DockMinimizer.app"
+
+"$ROOT/Scripts/bundle.sh"
+
+echo "==> 실행 중인 인스턴스 종료"
+pkill -x DockMinimizer 2>/dev/null || true
+sleep 1
+
+echo "==> 설치: $DEST"
+rm -rf "$DEST"
+cp -R "$ROOT/build/DockMinimizer.app" "$DEST"
+
+echo "==> 실행"
+open "$DEST"
+echo "완료."
+```
+
+- [ ] **Step 5: 설치**
+
+Run: `chmod +x Scripts/install.sh && ./Scripts/install.sh`
+Expected: `완료.` 그리고 메뉴바 오른쪽에 아이콘이 나타난다.
+
+- [ ] **Step 6: 육안 확인**
+
+메뉴바 아이콘을 클릭해 "종료" 메뉴가 나오는지 확인한다. Dock에는 이 앱의 아이콘이 **나타나지 않아야** 한다.
+
+- [ ] **Step 7: 접근성 권한 부여**
+
+시스템 설정 > 개인정보 보호 및 보안 > 손쉬운 사용 에서 `+` 버튼으로 `/Applications/DockMinimizer.app`을 추가하고 켠다.
+
+- [ ] **Step 8: 재빌드 후에도 권한이 유지되는지 확인 (서명 파이프라인의 핵심 검증)**
+
+Run: `./Scripts/install.sh`
+
+그 후 시스템 설정 > 손쉬운 사용 목록에서 DockMinimizer가 **여전히 켜져 있는지** 확인한다. 꺼져 있거나 사라졌다면 서명이 불안정한 것이므로 Task 4로 돌아간다. 이 검증을 통과해야 Phase 2로 넘어간다.
+
+- [ ] **Step 9: 커밋**
+
+```bash
+git add -A
+git commit -m "feat: 메뉴바 껍데기와 설치 스크립트"
+```
+
+---
+
+# Phase 2 — 핵심 로직
+
+## Task 6: Core 값 타입과 히트테스트
+
+**Files:**
+- Delete: `Sources/DockMinimizerCore/Placeholder.swift`
+- Delete: `Tests/DockMinimizerCoreTests/PlaceholderTests.swift`
+- Create: `Sources/DockMinimizerCore/DockSnapshot.swift`
+- Create: `Sources/DockMinimizerCore/AppState.swift`
+- Test: `Tests/DockMinimizerCoreTests/DockSnapshotTests.swift`
+
+- [ ] **Step 1: 실패하는 테스트 작성**
+
+`Tests/DockMinimizerCoreTests/DockSnapshotTests.swift`:
+
+```swift
+import CoreGraphics
+import Testing
+@testable import DockMinimizerCore
+
+private func item(_ x: CGFloat, _ bundleID: String?) -> DockItem {
+    DockItem(
+        frame: CGRect(x: x, y: 1000, width: 50, height: 50),
+        bundleID: bundleID,
+        title: bundleID
+    )
+}
+
+@Test("좌표가 아이콘 안이면 그 아이콘을 반환한다")
+func hitTestInside() {
+    let snapshot = DockSnapshot(items: [item(0, "a"), item(100, "b")])
+    #expect(snapshot.item(at: CGPoint(x: 120, y: 1020))?.bundleID == "b")
+}
+
+@Test("아이콘 사이의 빈 공간은 nil을 반환한다")
+func hitTestBetweenIcons() {
+    let snapshot = DockSnapshot(items: [item(0, "a"), item(100, "b")])
+    #expect(snapshot.item(at: CGPoint(x: 75, y: 1020)) == nil)
+}
+
+@Test("Dock 바깥 좌표는 nil을 반환한다")
+func hitTestOutside() {
+    let snapshot = DockSnapshot(items: [item(0, "a")])
+    #expect(snapshot.item(at: CGPoint(x: 500, y: 300)) == nil)
+}
+
+@Test("아이콘의 왼쪽·위쪽 경계는 포함된다")
+func hitTestLeadingEdgeIsInclusive() {
+    let snapshot = DockSnapshot(items: [item(0, "a")])
+    #expect(snapshot.item(at: CGPoint(x: 0, y: 1000))?.bundleID == "a")
+}
+
+@Test("아이콘의 오른쪽 경계는 포함되지 않는다")
+func hitTestTrailingEdgeIsExclusive() {
+    let snapshot = DockSnapshot(items: [item(0, "a")])
+    #expect(snapshot.item(at: CGPoint(x: 50, y: 1020)) == nil)
+}
+
+@Test("빈 스냅샷은 항상 nil을 반환한다")
+func hitTestEmptySnapshot() {
+    #expect(DockSnapshot.empty.item(at: CGPoint(x: 10, y: 1010)) == nil)
+}
+```
+
+- [ ] **Step 2: 실패 확인**
+
+Run: `swift test --filter DockSnapshotTests`
+Expected: FAIL — `cannot find 'DockItem' in scope`
+
+- [ ] **Step 3: 스텁 파일 삭제**
+
+```bash
+rm Sources/DockMinimizerCore/Placeholder.swift Tests/DockMinimizerCoreTests/PlaceholderTests.swift
+```
+
+- [ ] **Step 4: `Sources/DockMinimizerCore/DockSnapshot.swift` 작성**
+
+```swift
+import CoreGraphics
+import Foundation
+
+/// Dock에 표시된 아이콘 하나. AX 트리에서 읽어 온 스냅샷 값이며 갱신 시점에 통째로 교체된다.
+public struct DockItem: Equatable, Sendable {
+    /// 전역 디스플레이 좌표. `CGEvent.location`과 같은 공간이어야 한다.
+    public let frame: CGRect
+    public let bundleID: String?
+    public let title: String?
+
+    public init(frame: CGRect, bundleID: String?, title: String?) {
+        self.frame = frame
+        self.bundleID = bundleID
+        self.title = title
+    }
+}
+
+/// 특정 시점의 Dock 아이콘 배치. 불변이므로 이벤트 탭 콜백에서 락 없이 읽을 수 있다.
+public struct DockSnapshot: Equatable, Sendable {
+    public let items: [DockItem]
+
+    public static let empty = DockSnapshot(items: [])
+
+    public init(items: [DockItem]) {
+        self.items = items
+    }
+
+    /// 주어진 좌표를 포함하는 첫 아이콘. `CGRect.contains`는 왼쪽·위쪽 경계를
+    /// 포함하고 오른쪽·아래쪽 경계를 제외하므로 인접 아이콘이 중복 매칭되지 않는다.
+    public func item(at point: CGPoint) -> DockItem? {
+        items.first { $0.frame.contains(point) }
+    }
+}
+```
+
+- [ ] **Step 5: `Sources/DockMinimizerCore/AppState.swift` 작성**
+
+```swift
+import Foundation
+
+/// 판정에 필요한 프론트모스트 앱의 상태. AX 조회 결과를 미리 계산해 담아 둔 값이다.
+public struct AppState: Equatable, Sendable {
+    public let pid: pid_t
+    public let bundleID: String
+    /// 최소화되지 않은 표준 윈도우가 하나 이상 있는가.
+    public let hasVisibleWindows: Bool
+
+    public init(pid: pid_t, bundleID: String, hasVisibleWindows: Bool) {
+        self.pid = pid
+        self.bundleID = bundleID
+        self.hasVisibleWindows = hasVisibleWindows
+    }
+}
+```
+
+- [ ] **Step 6: 테스트 통과 확인**
+
+Run: `swift test --filter DockSnapshotTests`
+Expected: PASS — 6 tests passed
+
+- [ ] **Step 7: 커밋**
+
+```bash
+git add -A
+git commit -m "feat: DockSnapshot 히트테스트와 Core 값 타입"
+```
+
+## Task 7: ClickRouter 판정 로직
+
+앱의 모든 판정이 여기 모인다. AX도 CGEvent도 건드리지 않는 순수 함수이므로 전 분기를 테스트로 고정한다.
+
+**Files:**
+- Create: `Sources/DockMinimizerCore/ClickRouter.swift`
+- Test: `Tests/DockMinimizerCoreTests/ClickRouterTests.swift`
+
+- [ ] **Step 1: 실패하는 테스트 작성**
+
+`Tests/DockMinimizerCoreTests/ClickRouterTests.swift`:
+
+```swift
+import CoreGraphics
+import Testing
+@testable import DockMinimizerCore
+
+private let safariIcon = DockItem(
+    frame: CGRect(x: 0, y: 1000, width: 50, height: 50),
+    bundleID: "com.apple.Safari",
+    title: "Safari"
+)
+private let notesIcon = DockItem(
+    frame: CGRect(x: 100, y: 1000, width: 50, height: 50),
+    bundleID: "com.apple.Notes",
+    title: "메모"
+)
+private let onSafari = CGPoint(x: 25, y: 1025)
+private let onNotes = CGPoint(x: 125, y: 1025)
+
+private func makeInput(
+    point: CGPoint = onSafari,
+    modifiers: ClickModifiers = [],
+    items: [DockItem] = [safariIcon, notesIcon],
+    frontmost: AppState? = AppState(pid: 42, bundleID: "com.apple.Safari", hasVisibleWindows: true),
+    minimizedByUs: Set<pid_t> = [],
+    isEnabled: Bool = true,
+    excluded: Set<String> = []
+) -> RouterInput {
+    RouterInput(
+        point: point,
+        modifiers: modifiers,
+        snapshot: DockSnapshot(items: items),
+        frontmost: frontmost,
+        minimizedByUs: minimizedByUs,
+        isEnabled: isEnabled,
+        excludedBundleIDs: excluded
+    )
+}
+
+@Test("프론트모스트 앱의 아이콘 클릭은 최소화한다")
+func minimizesFrontmostApp() {
+    #expect(ClickRouter.decide(makeInput()) == .minimize(pid: 42))
+}
+
+@Test("비활성 상태에서는 개입하지 않는다")
+func ignoresWhenDisabled() {
+    #expect(ClickRouter.decide(makeInput(isEnabled: false)) == .ignore)
+}
+
+@Test("수정자 키가 눌린 클릭은 개입하지 않는다")
+func ignoresModifiedClicks() {
+    for modifier in [ClickModifiers.command, .option, .control, .shift] {
+        #expect(ClickRouter.decide(makeInput(modifiers: modifier)) == .ignore)
+    }
+}
+
+@Test("Dock 아이콘 바깥 클릭은 개입하지 않는다")
+func ignoresClicksOutsideDock() {
+    #expect(ClickRouter.decide(makeInput(point: CGPoint(x: 500, y: 300))) == .ignore)
+}
+
+@Test("bundleID를 알 수 없는 아이콘은 개입하지 않는다")
+func ignoresItemsWithoutBundleID() {
+    let trash = DockItem(frame: safariIcon.frame, bundleID: nil, title: "휴지통")
+    #expect(ClickRouter.decide(makeInput(items: [trash])) == .ignore)
+}
+
+@Test("제외 목록에 있는 앱은 개입하지 않는다")
+func ignoresExcludedApps() {
+    #expect(ClickRouter.decide(makeInput(excluded: ["com.apple.Safari"])) == .ignore)
+}
+
+@Test("프론트모스트가 아닌 앱의 아이콘 클릭은 개입하지 않는다")
+func ignoresNonFrontmostApp() {
+    #expect(ClickRouter.decide(makeInput(point: onNotes)) == .ignore)
+}
+
+@Test("프론트모스트 앱이 없으면 개입하지 않는다")
+func ignoresWhenNoFrontmostApp() {
+    #expect(ClickRouter.decide(makeInput(frontmost: nil)) == .ignore)
+}
+
+// 이중 가드 — 이 두 테스트가 "앱이 되살아나지 않는" 사고를 막는다.
+
+@Test("가드 1: 우리가 최소화한 앱은 통과시켜 Dock 기본 복원에 맡긴다")
+func letsThroughWhenAlreadyMinimizedByUs() {
+    #expect(ClickRouter.decide(makeInput(minimizedByUs: [42])) == .letThrough(pid: 42))
+}
+
+@Test("가드 2: 보이는 윈도우가 없으면 통과시킨다")
+func letsThroughWhenNoVisibleWindows() {
+    let front = AppState(pid: 42, bundleID: "com.apple.Safari", hasVisibleWindows: false)
+    #expect(ClickRouter.decide(makeInput(frontmost: front)) == .letThrough(pid: 42))
+}
+
+@Test("최소화 후 복원, 그리고 재최소화가 순환한다")
+func minimizeRestoreMinimizeCycle() {
+    // 1회차: 최소화
+    #expect(ClickRouter.decide(makeInput()) == .minimize(pid: 42))
+
+    // 2회차: 우리가 최소화한 상태 → 통과 (Dock이 복원)
+    let afterMinimize = makeInput(
+        frontmost: AppState(pid: 42, bundleID: "com.apple.Safari", hasVisibleWindows: false),
+        minimizedByUs: [42]
+    )
+    #expect(ClickRouter.decide(afterMinimize) == .letThrough(pid: 42))
+
+    // 3회차: 복원되어 상태가 정리된 뒤 → 다시 최소화
+    #expect(ClickRouter.decide(makeInput()) == .minimize(pid: 42))
+}
+```
+
+- [ ] **Step 2: 실패 확인**
+
+Run: `swift test --filter ClickRouterTests`
+Expected: FAIL — `cannot find 'ClickRouter' in scope`
+
+- [ ] **Step 3: `Sources/DockMinimizerCore/ClickRouter.swift` 작성**
+
+```swift
+import CoreGraphics
+import Foundation
+
+/// 수정자 키. CGEventFlags를 그대로 쓰지 않는 이유는 Core를 CoreGraphics 이벤트
+/// API에서 분리해 테스트하기 쉽게 만들기 위함이다. 변환은 EventTapController가 한다.
+public struct ClickModifiers: OptionSet, Sendable {
+    public let rawValue: Int
+    public init(rawValue: Int) { self.rawValue = rawValue }
+
+    public static let command = ClickModifiers(rawValue: 1 << 0)
+    public static let option = ClickModifiers(rawValue: 1 << 1)
+    public static let control = ClickModifiers(rawValue: 1 << 2)
+    public static let shift = ClickModifiers(rawValue: 1 << 3)
+}
+
+public struct RouterInput: Sendable {
+    public let point: CGPoint
+    public let modifiers: ClickModifiers
+    public let snapshot: DockSnapshot
+    public let frontmost: AppState?
+    public let minimizedByUs: Set<pid_t>
+    public let isEnabled: Bool
+    public let excludedBundleIDs: Set<String>
+
+    public init(
+        point: CGPoint,
+        modifiers: ClickModifiers,
+        snapshot: DockSnapshot,
+        frontmost: AppState?,
+        minimizedByUs: Set<pid_t>,
+        isEnabled: Bool,
+        excludedBundleIDs: Set<String>
+    ) {
+        self.point = point
+        self.modifiers = modifiers
+        self.snapshot = snapshot
+        self.frontmost = frontmost
+        self.minimizedByUs = minimizedByUs
+        self.isEnabled = isEnabled
+        self.excludedBundleIDs = excludedBundleIDs
+    }
+}
+
+public enum Decision: Equatable, Sendable {
+    /// 우리 관심사가 아니다. Plan B에서도 이벤트를 삼키지 않는다.
+    case ignore
+    /// 이 앱을 최소화한다. Plan B에서는 이 경우에만 이벤트를 삼킨다.
+    case minimize(pid: pid_t)
+    /// 우리 앱 아이콘이고 프론트모스트지만 의도적으로 최소화하지 않는다.
+    /// Dock 기본 복원 동작에 맡기고, 호출자는 minimizedByUs에서 pid를 제거해야 한다.
+    case letThrough(pid: pid_t)
+}
+
+/// 앱의 모든 판정이 모이는 순수 함수. AX도 CGEvent도 호출하지 않으므로
+/// 이벤트 탭 콜백에서 안전하게 실행되고, 전 분기를 단위 테스트로 고정할 수 있다.
+public enum ClickRouter {
+    public static func decide(_ input: RouterInput) -> Decision {
+        guard input.isEnabled else { return .ignore }
+
+        // 우클릭 메뉴, ⌘클릭(Finder에서 보기), 옵션클릭 등 기존 동작을 건드리지 않는다.
+        guard input.modifiers.isEmpty else { return .ignore }
+
+        guard let item = input.snapshot.item(at: input.point) else { return .ignore }
+
+        // 휴지통, 스택, 폴더처럼 앱이 아닌 항목은 bundleID가 없다.
+        guard let bundleID = item.bundleID else { return .ignore }
+
+        guard !input.excludedBundleIDs.contains(bundleID) else { return .ignore }
+
+        // 프론트모스트가 아닌 앱은 Dock 기본 동작(활성화)을 그대로 둔다.
+        guard let front = input.frontmost, front.bundleID == bundleID else { return .ignore }
+
+        // 가드 1: 우리가 최소화한 앱이면 복원 클릭이다. 삼키면 앱을 되살릴 수 없게 된다.
+        if input.minimizedByUs.contains(front.pid) {
+            return .letThrough(pid: front.pid)
+        }
+
+        // 가드 2: 최소화할 윈도우가 없으면 개입할 이유가 없다.
+        // 윈도우 없는 메뉴바 전용 앱과 가드 1의 상태 드리프트를 함께 막는다.
+        guard front.hasVisibleWindows else {
+            return .letThrough(pid: front.pid)
+        }
+
+        return .minimize(pid: front.pid)
+    }
+}
+```
+
+- [ ] **Step 4: 테스트 통과 확인**
+
+Run: `swift test --filter ClickRouterTests`
+Expected: PASS — 11 tests passed
+
+- [ ] **Step 5: 커밋**
+
+```bash
+git add -A
+git commit -m "feat: ClickRouter 판정 로직과 이중 가드"
+```
+
+## Task 8: 설정 모델
+
+**Files:**
+- Create: `Sources/DockMinimizerCore/Settings.swift`
+- Test: `Tests/DockMinimizerCoreTests/SettingsTests.swift`
+
+- [ ] **Step 1: 실패하는 테스트 작성**
+
+`Tests/DockMinimizerCoreTests/SettingsTests.swift`:
+
+```swift
+import Foundation
+import Testing
+@testable import DockMinimizerCore
+
+private func makeDefaults(_ name: String) -> UserDefaults {
+    let defaults = UserDefaults(suiteName: name)!
+    defaults.removePersistentDomain(forName: name)
+    return defaults
+}
+
+@Test("기본값은 활성 상태다")
+func defaultsToEnabled() {
+    let settings = Settings(defaults: makeDefaults("test.enabled"))
+    #expect(settings.isEnabled)
+}
+
+@Test("Finder와 자기 자신은 항상 제외된다")
+func alwaysExcludesFinderAndSelf() {
+    let settings = Settings(defaults: makeDefaults("test.builtin"))
+    #expect(settings.excludedBundleIDs.contains("com.apple.finder"))
+    #expect(settings.excludedBundleIDs.contains("com.changhun.dockminimizer"))
+}
+
+@Test("사용자가 추가한 제외 앱이 목록에 합쳐진다")
+func mergesUserExclusions() {
+    let settings = Settings(defaults: makeDefaults("test.merge"))
+    settings.addExclusion("com.apple.Safari")
+    #expect(settings.excludedBundleIDs.contains("com.apple.Safari"))
+    #expect(settings.excludedBundleIDs.contains("com.apple.finder"))
+}
+
+@Test("사용자 제외 앱을 제거할 수 있다")
+func removesUserExclusions() {
+    let settings = Settings(defaults: makeDefaults("test.remove"))
+    settings.addExclusion("com.apple.Safari")
+    settings.removeExclusion("com.apple.Safari")
+    #expect(!settings.excludedBundleIDs.contains("com.apple.Safari"))
+}
+
+@Test("고정 제외 앱은 제거되지 않는다")
+func cannotRemoveBuiltinExclusions() {
+    let settings = Settings(defaults: makeDefaults("test.pinned"))
+    settings.removeExclusion("com.apple.finder")
+    #expect(settings.excludedBundleIDs.contains("com.apple.finder"))
+}
+
+@Test("설정이 영속화된다")
+func persistsAcrossInstances() {
+    let defaults = makeDefaults("test.persist")
+    let first = Settings(defaults: defaults)
+    first.isEnabled = false
+    first.addExclusion("com.apple.Safari")
+
+    let second = Settings(defaults: defaults)
+    #expect(!second.isEnabled)
+    #expect(second.userExcludedBundleIDs.contains("com.apple.Safari"))
+}
+```
+
+- [ ] **Step 2: 실패 확인**
+
+Run: `swift test --filter SettingsTests`
+Expected: FAIL — `cannot find 'Settings' in scope`
+
+- [ ] **Step 3: `Sources/DockMinimizerCore/Settings.swift` 작성**
+
+```swift
+import Foundation
+
+/// UserDefaults 기반 설정. 읽기는 이벤트 탭 콜백 밖(Coordinator의 캐시 갱신 시점)에서만 하고,
+/// 콜백에는 스냅샷된 값을 넘긴다.
+public final class Settings: @unchecked Sendable {
+    /// 사용자가 제거할 수 없는 제외 목록.
+    /// Finder는 Dock 동작이 특수하고, 자기 자신은 LSUIElement라 아이콘조차 없다.
+    public static let pinnedExclusions: Set<String> = [
+        "com.apple.finder",
+        "com.changhun.dockminimizer",
+    ]
+
+    private enum Key {
+        static let isEnabled = "isEnabled"
+        static let userExclusions = "userExcludedBundleIDs"
+    }
+
+    private let defaults: UserDefaults
+
+    public init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        defaults.register(defaults: [Key.isEnabled: true])
+    }
+
+    public var isEnabled: Bool {
+        get { defaults.bool(forKey: Key.isEnabled) }
+        set { defaults.set(newValue, forKey: Key.isEnabled) }
+    }
+
+    public var userExcludedBundleIDs: Set<String> {
+        get { Set(defaults.stringArray(forKey: Key.userExclusions) ?? []) }
+        set { defaults.set(Array(newValue).sorted(), forKey: Key.userExclusions) }
+    }
+
+    /// 판정에 실제로 쓰이는 최종 제외 목록.
+    public var excludedBundleIDs: Set<String> {
+        Settings.pinnedExclusions.union(userExcludedBundleIDs)
+    }
+
+    public func addExclusion(_ bundleID: String) {
+        userExcludedBundleIDs.insert(bundleID)
+    }
+
+    public func removeExclusion(_ bundleID: String) {
+        userExcludedBundleIDs.remove(bundleID)
+    }
+}
+```
+
+- [ ] **Step 4: 테스트 통과 확인**
+
+Run: `swift test --filter SettingsTests`
+Expected: PASS — 6 tests passed
+
+- [ ] **Step 5: 전체 테스트 실행**
+
+Run: `swift test`
+Expected: PASS — 23 tests passed
+
+- [ ] **Step 6: 커밋**
+
+```bash
+git add -A
+git commit -m "feat: 설정 모델과 제외 목록"
+```
+
+## Task 9: AX 헬퍼
+
+**Files:**
+- Create: `Sources/DockMinimizer/AXHelpers.swift`
+
+- [ ] **Step 1: `Sources/DockMinimizer/AXHelpers.swift` 작성**
+
+```swift
+import AppKit
+import ApplicationServices
+
+/// AX API의 C 스타일 인터페이스를 감싸는 얇은 래퍼.
+/// 여기 있는 함수는 전부 크로스 프로세스 IPC이므로 **이벤트 탭 콜백에서 호출 금지**.
+enum AX {
+    /// AX 호출이 무한정 블록되지 않도록 하는 기본 타임아웃(초).
+    static let messagingTimeout: Float = 0.5
+
+    static func application(pid: pid_t) -> AXUIElement {
+        let element = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(element, messagingTimeout)
+        return element
+    }
+
+    static func value(_ element: AXUIElement, _ name: String) -> CFTypeRef? {
+        var result: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, name as CFString, &result) == .success else {
+            return nil
+        }
+        return result
+    }
+
+    static func string(_ element: AXUIElement, _ name: String) -> String? {
+        value(element, name) as? String
+    }
+
+    static func bool(_ element: AXUIElement, _ name: String) -> Bool? {
+        value(element, name) as? Bool
+    }
+
+    static func url(_ element: AXUIElement, _ name: String) -> URL? {
+        value(element, name) as? URL
+    }
+
+    static func children(_ element: AXUIElement) -> [AXUIElement] {
+        (value(element, kAXChildrenAttribute as String) as? [AXUIElement]) ?? []
+    }
+
+    static func windows(_ element: AXUIElement) -> [AXUIElement] {
+        (value(element, kAXWindowsAttribute as String) as? [AXUIElement]) ?? []
+    }
+
+    static func frame(_ element: AXUIElement) -> CGRect? {
+        guard let rawPosition = value(element, kAXPositionAttribute as String),
+              let rawSize = value(element, kAXSizeAttribute as String) else {
+            return nil
+        }
+        var point = CGPoint.zero
+        var size = CGSize.zero
+        guard AXValueGetValue(rawPosition as! AXValue, .cgPoint, &point),
+              AXValueGetValue(rawSize as! AXValue, .cgSize, &size) else {
+            return nil
+        }
+        return CGRect(origin: point, size: size)
+    }
+
+    @discardableResult
+    static func setBool(_ element: AXUIElement, _ name: String, _ newValue: Bool) -> Bool {
+        AXUIElementSetAttributeValue(
+            element,
+            name as CFString,
+            newValue ? kCFBooleanTrue : kCFBooleanFalse
+        ) == .success
+    }
+}
+```
+
+- [ ] **Step 2: 빌드 확인**
+
+Run: `swift build`
+Expected: `Build complete!`
+
+- [ ] **Step 3: 커밋**
+
+```bash
+git add -A
+git commit -m "feat: AX API 래퍼"
+```
+
+## Task 10: DockIndex 캐시
+
+**전제:** Task 1~2의 findings 문서를 먼저 읽는다. AXList 순회 방법, bundleID 획득 방법, 좌표 변환식이 거기 적혀 있다. 아래 코드는 "AXList를 재귀로 전부 수집하고, `AXURL`에서 bundleID를 얻으며, 좌표 변환이 필요 없다"는 가정으로 작성되었다. findings가 다르면 해당 부분만 고친다.
+
+**Files:**
+- Create: `Sources/DockMinimizer/DockIndex.swift`
+
+- [ ] **Step 1: `Sources/DockMinimizer/DockIndex.swift` 작성**
+
+```swift
+import AppKit
+import ApplicationServices
+import DockMinimizerCore
+import os
+
+/// Dock의 AX 트리를 주기적으로 읽어 불변 스냅샷으로 캐싱한다.
+///
+/// 이 클래스의 존재 이유가 곧 이 프로젝트의 최우선 제약이다. Dock AX 조회는 수십 밀리초가
+/// 걸리는 크로스 프로세스 IPC이고, 이벤트 탭 콜백에서 그만큼 지연되면 macOS가
+/// kCGEventTapDisabledByTimeout으로 탭을 조용히 죽인다. 그래서 모든 AX 조회를
+/// 전용 시리얼 큐에서 미리 수행하고, 콜백은 `snapshot`만 읽는다.
+final class DockIndex: @unchecked Sendable {
+    private let queue = DispatchQueue(label: "com.changhun.dockminimizer.dockindex")
+    private let storage = OSAllocatedUnfairLock(initialState: DockSnapshot.empty)
+    private var bundleIDCache: [URL: String] = [:]
+    private var refreshTimer: DispatchSourceTimer?
+    private var observers: [NSObjectProtocol] = []
+
+    /// 이벤트 탭 콜백이 호출하는 유일한 메서드. 락 획득과 배열 참조 복사만 한다.
+    var snapshot: DockSnapshot {
+        storage.withLock { $0 }
+    }
+
+    func start() {
+        registerObservers()
+        startTimer()
+        refresh()
+    }
+
+    func stop() {
+        refreshTimer?.cancel()
+        refreshTimer = nil
+        for observer in observers {
+            NSWorkspace.shared.notificationCenter.removeObserver(observer)
+            NotificationCenter.default.removeObserver(observer)
+        }
+        observers.removeAll()
+    }
+
+    func refresh() {
+        queue.async { [weak self] in
+            guard let self else { return }
+            let fresh = self.buildSnapshot()
+            self.storage.withLock { $0 = fresh }
+        }
+    }
+
+    // MARK: - 갱신 트리거
+
+    private func registerObservers() {
+        let workspaceCenter = NSWorkspace.shared.notificationCenter
+        let workspaceNotifications: [NSNotification.Name] = [
+            NSWorkspace.didLaunchApplicationNotification,
+            NSWorkspace.didTerminateApplicationNotification,
+            NSWorkspace.didHideApplicationNotification,
+            NSWorkspace.didUnhideApplicationNotification,
+        ]
+        for name in workspaceNotifications {
+            observers.append(workspaceCenter.addObserver(
+                forName: name, object: nil, queue: nil
+            ) { [weak self] _ in
+                self?.refresh()
+            })
+        }
+
+        // 해상도 변경이나 디스플레이 연결 시 Dock 아이콘 좌표가 통째로 바뀐다.
+        observers.append(NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil, queue: nil
+        ) { [weak self] _ in
+            self?.refresh()
+        })
+    }
+
+    /// 안전망. 위 알림으로 잡히지 않는 변화(Dock 설정 변경, Dock 재시작, 아이콘 재배열)를
+    /// 짧은 주기로 흡수한다. 아이콘 30개 수준의 AX 순회는 백그라운드에서 충분히 가볍다.
+    private func startTimer() {
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + 1.0, repeating: 1.0)
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            let fresh = self.buildSnapshot()
+            self.storage.withLock { $0 = fresh }
+        }
+        timer.resume()
+        refreshTimer = timer
+    }
+
+    // MARK: - AX 조회 (반드시 queue 위에서만 실행)
+
+    private func buildSnapshot() -> DockSnapshot {
+        guard let dock = NSRunningApplication
+            .runningApplications(withBundleIdentifier: "com.apple.dock").first else {
+            return .empty
+        }
+        // Dock이 재시작되면 pid가 바뀌지만, 매번 새로 조회하므로 자동으로 따라간다.
+        let dockElement = AX.application(pid: dock.processIdentifier)
+
+        var lists: [AXUIElement] = []
+        collectLists(dockElement, depth: 0, into: &lists)
+
+        var items: [DockItem] = []
+        for list in lists {
+            for element in AX.children(list) {
+                guard let frame = AX.frame(element), frame.width > 0, frame.height > 0 else {
+                    continue
+                }
+                items.append(DockItem(
+                    frame: frame,
+                    bundleID: bundleID(of: element),
+                    title: AX.string(element, kAXTitleAttribute as String)
+                ))
+            }
+        }
+        return DockSnapshot(items: items)
+    }
+
+    /// Dock은 앱 / 최근 항목 / 휴지통을 별개의 AXList로 나눠 가질 수 있으므로 전부 수집한다.
+    private func collectLists(_ element: AXUIElement, depth: Int, into result: inout [AXUIElement]) {
+        guard depth <= 6 else { return }
+        if AX.string(element, kAXRoleAttribute as String) == "AXList" {
+            result.append(element)
+        }
+        for child in AX.children(element) {
+            collectLists(child, depth: depth + 1, into: &result)
+        }
+    }
+
+    /// `Bundle(url:)`은 디스크 I/O이므로 URL 기준으로 캐싱한다.
+    private func bundleID(of element: AXUIElement) -> String? {
+        guard let url = AX.url(element, "AXURL") else { return nil }
+        if let cached = bundleIDCache[url] { return cached }
+        guard let identifier = Bundle(url: url)?.bundleIdentifier else { return nil }
+        bundleIDCache[url] = identifier
+        return identifier
+    }
+}
+```
+
+- [ ] **Step 2: 빌드 확인**
+
+Run: `swift build`
+Expected: `Build complete!`
+
+- [ ] **Step 3: 커밋**
+
+```bash
+git add -A
+git commit -m "feat: DockIndex — Dock AX 트리 스냅샷 캐시"
+```
+
+## Task 11: AppStateCache
+
+**Files:**
+- Create: `Sources/DockMinimizer/AppStateCache.swift`
+
+- [ ] **Step 1: `Sources/DockMinimizer/AppStateCache.swift` 작성**
+
+```swift
+import AppKit
+import ApplicationServices
+import DockMinimizerCore
+import os
+
+/// 프론트모스트 앱의 상태와 `minimizedByUs` 집합을 캐싱한다.
+///
+/// DockIndex와 같은 이유로 존재한다. `NSWorkspace.frontmostApplication`과 윈도우 목록
+/// 조회는 모두 IPC일 수 있으므로 이벤트 탭 콜백에서 호출하지 않고 여기서 미리 계산해 둔다.
+final class AppStateCache: @unchecked Sendable {
+    private struct State: Sendable {
+        var frontmost: AppState?
+        var minimizedByUs: Set<pid_t> = []
+    }
+
+    private let queue = DispatchQueue(label: "com.changhun.dockminimizer.appstate")
+    private let storage = OSAllocatedUnfairLock(initialState: State())
+    private var refreshTimer: DispatchSourceTimer?
+    private var observers: [NSObjectProtocol] = []
+
+    /// 이벤트 탭 콜백이 읽는 값.
+    var frontmost: AppState? {
+        storage.withLock { $0.frontmost }
+    }
+
+    var minimizedByUs: Set<pid_t> {
+        storage.withLock { $0.minimizedByUs }
+    }
+
+    func start() {
+        registerObservers()
+        startTimer()
+        refresh()
+    }
+
+    func stop() {
+        refreshTimer?.cancel()
+        refreshTimer = nil
+        for observer in observers {
+            NSWorkspace.shared.notificationCenter.removeObserver(observer)
+        }
+        observers.removeAll()
+    }
+
+    /// Minimizer가 실제로 윈도우를 최소화한 직후 호출한다.
+    func markMinimizedByUs(pid: pid_t) {
+        storage.withLock { state in
+            state.minimizedByUs.insert(pid)
+            if var front = state.frontmost, front.pid == pid {
+                front = AppState(
+                    pid: front.pid,
+                    bundleID: front.bundleID,
+                    hasVisibleWindows: false
+                )
+                state.frontmost = front
+            }
+        }
+    }
+
+    /// ClickRouter가 `.letThrough`를 반환했을 때 호출한다. Dock이 복원할 것이므로
+    /// 우리 상태에서도 지운다.
+    func clearMinimizedByUs(pid: pid_t) {
+        storage.withLock { $0.minimizedByUs.remove(pid) }
+    }
+
+    // MARK: - 갱신
+
+    private func registerObservers() {
+        let center = NSWorkspace.shared.notificationCenter
+        observers.append(center.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil, queue: nil
+        ) { [weak self] _ in
+            self?.refresh()
+        })
+
+        observers.append(center.addObserver(
+            forName: NSWorkspace.didTerminateApplicationNotification,
+            object: nil, queue: nil
+        ) { [weak self] notification in
+            guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey]
+                as? NSRunningApplication else { return }
+            self?.storage.withLock { $0.minimizedByUs.remove(app.processIdentifier) }
+            self?.refresh()
+        })
+    }
+
+    /// 불변식 복구용 안전망. 사용자가 ⌘Tab이나 Mission Control로 윈도우를 되살리면
+    /// 알림이 오지 않으므로, 짧은 주기로 실제 상태를 다시 읽어 minimizedByUs를 정리한다.
+    /// 앱 하나의 윈도우 목록 조회이므로 비용이 작다.
+    private func startTimer() {
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + 0.5, repeating: 0.5)
+        timer.setEventHandler { [weak self] in
+            self?.performRefresh()
+        }
+        timer.resume()
+        refreshTimer = timer
+    }
+
+    private func refresh() {
+        queue.async { [weak self] in
+            self?.performRefresh()
+        }
+    }
+
+    private func performRefresh() {
+        guard let app = NSWorkspace.shared.frontmostApplication,
+              let bundleID = app.bundleIdentifier else {
+            storage.withLock { $0.frontmost = nil }
+            return
+        }
+        let pid = app.processIdentifier
+        let visible = Self.hasVisibleWindows(pid: pid)
+
+        storage.withLock { state in
+            state.frontmost = AppState(pid: pid, bundleID: bundleID, hasVisibleWindows: visible)
+            // 보이는 윈도우가 다시 생겼다면 우리 최소화 상태는 더 이상 유효하지 않다.
+            if visible {
+                state.minimizedByUs.remove(pid)
+            }
+        }
+    }
+
+    /// 최소화되지 않은 표준 윈도우가 하나 이상 있는가.
+    static func hasVisibleWindows(pid: pid_t) -> Bool {
+        let element = AX.application(pid: pid)
+        for window in AX.windows(element) {
+            guard AX.string(window, kAXSubroleAttribute as String) == (kAXStandardWindowSubrole as String) else {
+                continue
+            }
+            if AX.bool(window, kAXMinimizedAttribute as String) == true { continue }
+            return true
+        }
+        return false
+    }
+}
+```
+
+- [ ] **Step 2: 빌드 확인**
+
+Run: `swift build`
+Expected: `Build complete!`
+
+- [ ] **Step 3: 커밋**
+
+```bash
+git add -A
+git commit -m "feat: AppStateCache — 프론트모스트 상태와 minimizedByUs 불변식"
+```
+
+## Task 12: Minimizer
+
+**Files:**
+- Create: `Sources/DockMinimizer/Minimizer.swift`
+
+- [ ] **Step 1: `Sources/DockMinimizer/Minimizer.swift` 작성**
+
+```swift
+import AppKit
+import ApplicationServices
+
+/// 대상 앱의 표준 윈도우를 최소화한다. AX 호출이므로 백그라운드 큐에서만 실행한다.
+enum Minimizer {
+    /// 최소화한 윈도우 개수를 반환한다. 0이면 최소화할 것이 없었다는 뜻이다.
+    @discardableResult
+    static func minimize(pid: pid_t) -> Int {
+        let element = AX.application(pid: pid)
+        var count = 0
+
+        for window in AX.windows(element) {
+            // 시트, 팝오버, 플로팅 패널은 건드리지 않는다.
+            guard AX.string(window, kAXSubroleAttribute as String) == (kAXStandardWindowSubrole as String) else {
+                continue
+            }
+            // 이미 최소화된 윈도우는 건너뛴다.
+            if AX.bool(window, kAXMinimizedAttribute as String) == true { continue }
+            // 풀스크린 윈도우는 최소화할 수 없다. 시도하면 실패하거나 이상 동작을 한다.
+            if AX.bool(window, "AXFullScreen") == true { continue }
+
+            if AX.setBool(window, kAXMinimizedAttribute as String, true) {
+                count += 1
+            }
+        }
+        return count
+    }
+}
+```
+
+- [ ] **Step 2: 빌드 확인**
+
+Run: `swift build`
+Expected: `Build complete!`
+
+- [ ] **Step 3: 커밋**
+
+```bash
+git add -A
+git commit -m "feat: Minimizer — 표준 윈도우 최소화"
+```
+
+## Task 13: EventTapController
+
+**전제:** Task 2 Step 4의 Plan A / Plan B 판정 결과를 확인한다. 아래 코드는 두 모드를 모두 지원하며, `TapMode` 기본값만 바꾸면 된다. Plan A로 판정되었으면 `.listenOnly`, Plan B면 `.active`를 쓴다.
+
+**Files:**
+- Create: `Sources/DockMinimizer/EventTapController.swift`
+
+- [ ] **Step 1: `Sources/DockMinimizer/EventTapController.swift` 작성**
+
+```swift
+import AppKit
+import CoreGraphics
+import DockMinimizerCore
+import os
+
+/// 이벤트 탭의 수명을 관리한다.
+///
+/// 두 가지 방어 장치가 들어 있다.
+/// 1. 전용 스레드의 런루프에서 돌린다. 메인 스레드가 SwiftUI 렌더링 등으로 막히면
+///    탭 콜백이 지연되어 macOS가 탭을 죽이기 때문이다.
+/// 2. kCGEventTapDisabledByTimeout / ByUserInput을 잡아 즉시 재활성화한다.
+///    이 처리가 없으면 "한동안 잘 되다가 갑자기 멈추는" 증상이 나타난다.
+final class EventTapController: @unchecked Sendable {
+    enum TapMode {
+        /// Plan A. 클릭을 관찰만 한다. Dock 상호작용을 절대 깨뜨리지 않는다.
+        case listenOnly
+        /// Plan B. `.minimize` 판정 시 mouseDown/mouseUp을 쌍으로 삼킨다.
+        case active
+    }
+
+    /// 클릭 좌표와 수정자를 받아 판정을 돌려주는 콜백. 반드시 AX 호출 없이 즉시 반환해야 한다.
+    typealias Decider = (CGPoint, ClickModifiers) -> Decision
+    /// 판정 결과에 따른 실제 동작. 백그라운드로 비동기 디스패치된다.
+    typealias Performer = (Decision) -> Void
+
+    private let mode: TapMode
+    private let decide: Decider
+    private let perform: Performer
+    private let log = Logger(subsystem: "com.changhun.dockminimizer", category: "eventtap")
+
+    private var tap: CFMachPort?
+    private var runLoopSource: CFRunLoopSource?
+    private var thread: Thread?
+    private var threadRunLoop: CFRunLoop?
+
+    /// Plan B에서만 쓴다. mouseDown을 삼켰다면 짝이 되는 mouseUp도 삼켜야
+    /// Dock이 이상 상태에 빠지지 않는다.
+    private var swallowNextMouseUp = false
+
+    init(mode: TapMode, decide: @escaping Decider, perform: @escaping Performer) {
+        self.mode = mode
+        self.decide = decide
+        self.perform = perform
+    }
+
+    // MARK: - 수명
+
+    func start() {
+        let thread = Thread { [weak self] in
+            guard let self else { return }
+            self.threadRunLoop = CFRunLoopGetCurrent()
+            guard self.installTap() else { return }
+            CFRunLoopRun()
+        }
+        thread.name = "com.changhun.dockminimizer.eventtap"
+        thread.qualityOfService = .userInteractive
+        thread.start()
+        self.thread = thread
+    }
+
+    func stop() {
+        if let tap {
+            CGEvent.tapEnable(tap: tap, enable: false)
+        }
+        if let runLoop = threadRunLoop {
+            CFRunLoopStop(runLoop)
+        }
+        tap = nil
+        runLoopSource = nil
+        thread = nil
+        threadRunLoop = nil
+    }
+
+    private func installTap() -> Bool {
+        let mask = CGEventMask(
+            (1 << CGEventType.leftMouseDown.rawValue) |
+            (1 << CGEventType.leftMouseUp.rawValue)
+        )
+
+        let callback: CGEventTapCallBack = { _, type, event, refcon in
+            guard let refcon else { return Unmanaged.passUnretained(event) }
+            let controller = Unmanaged<EventTapController>.fromOpaque(refcon).takeUnretainedValue()
+            return controller.handle(type: type, event: event)
+        }
+
+        guard let tap = CGEvent.tapCreate(
+            tap: .cgSessionEventTap,
+            place: .headInsertEventTap,
+            options: mode == .listenOnly ? .listenOnly : .defaultTap,
+            eventsOfInterest: mask,
+            callback: callback,
+            userInfo: Unmanaged.passUnretained(self).toOpaque()
+        ) else {
+            log.error("이벤트 탭 생성 실패. 접근성 권한을 확인하세요.")
+            return false
+        }
+
+        let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+        CFRunLoopAddSource(CFRunLoopGetCurrent(), source, .commonModes)
+        CGEvent.tapEnable(tap: tap, enable: true)
+
+        self.tap = tap
+        self.runLoopSource = source
+        log.info("이벤트 탭 시작 (mode=\(String(describing: self.mode), privacy: .public))")
+        return true
+    }
+
+    // MARK: - 콜백
+    //
+    // 이 아래에서는 AX API를 절대 호출하지 않는다. 캐시 읽기와 산술 연산만 한다.
+
+    private func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
+        // 탭이 죽었을 때의 복구. 이 처리가 없으면 앱이 조용히 무력화된다.
+        if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+            log.error("이벤트 탭이 비활성화됨 (type=\(type.rawValue)). 재활성화합니다.")
+            if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
+            return Unmanaged.passUnretained(event)
+        }
+
+        let started = DispatchTime.now().uptimeNanoseconds
+
+        defer {
+            let elapsedMicroseconds = (DispatchTime.now().uptimeNanoseconds - started) / 1_000
+            // 예산을 크게 밑돌아야 정상이다. 넘어가면 캐시 밖 호출이 섞여 든 것이다.
+            if elapsedMicroseconds > 2_000 {
+                log.error("콜백이 느립니다: \(elapsedMicroseconds)µs")
+            }
+        }
+
+        if type == .leftMouseUp {
+            if mode == .active, swallowNextMouseUp {
+                swallowNextMouseUp = false
+                return nil
+            }
+            return Unmanaged.passUnretained(event)
+        }
+
+        guard type == .leftMouseDown else { return Unmanaged.passUnretained(event) }
+
+        let decision = decide(event.location, Self.modifiers(from: event.flags))
+
+        switch decision {
+        case .ignore:
+            return Unmanaged.passUnretained(event)
+
+        case .letThrough(let pid):
+            // 상태 정리는 콜백 밖에서 한다.
+            perform(.letThrough(pid: pid))
+            return Unmanaged.passUnretained(event)
+
+        case .minimize(let pid):
+            perform(.minimize(pid: pid))
+            if mode == .active {
+                swallowNextMouseUp = true
+                return nil
+            }
+            return Unmanaged.passUnretained(event)
+        }
+    }
+
+    private static func modifiers(from flags: CGEventFlags) -> ClickModifiers {
+        var result: ClickModifiers = []
+        if flags.contains(.maskCommand) { result.insert(.command) }
+        if flags.contains(.maskAlternate) { result.insert(.option) }
+        if flags.contains(.maskControl) { result.insert(.control) }
+        if flags.contains(.maskShift) { result.insert(.shift) }
+        return result
+    }
+}
+```
+
+- [ ] **Step 2: Phase 0 판정에 따라 모드 확정**
+
+findings 문서의 Plan A / Plan B 판정을 확인한다. Task 14의 `Coordinator`에서 이 값을 넘긴다.
+
+- [ ] **Step 3: 빌드 확인**
+
+Run: `swift build`
+Expected: `Build complete!`
+
+- [ ] **Step 4: 커밋**
+
+```bash
+git add -A
+git commit -m "feat: EventTapController — 전용 스레드 런루프와 탭 복구"
+```
+
+## Task 14: Coordinator 배선
+
+**Files:**
+- Create: `Sources/DockMinimizer/Coordinator.swift`
+- Modify: `Sources/DockMinimizer/AppDelegate.swift`
+
+- [ ] **Step 1: `Sources/DockMinimizer/Coordinator.swift` 작성**
+
+Phase 0에서 Plan A로 판정되었다면 `tapMode`를 `.listenOnly`로, Plan B면 `.active`로 둔다.
+
+```swift
+import AppKit
+import DockMinimizerCore
+import os
+
+/// 캐시, 판정, 실행을 잇는 조립부.
+final class Coordinator: @unchecked Sendable {
+    /// Phase 0 실측 결과에 따라 결정된다. findings 문서 참조.
+    static let tapMode: EventTapController.TapMode = .listenOnly
+
+    private let settings: Settings
+    private let dockIndex = DockIndex()
+    private let appState = AppStateCache()
+    private let work = DispatchQueue(label: "com.changhun.dockminimizer.work")
+    private let log = Logger(subsystem: "com.changhun.dockminimizer", category: "coordinator")
+
+    private var tapController: EventTapController?
+    private var isRunning = false
+
+    init(settings: Settings) {
+        self.settings = settings
+    }
+
+    /// 설정이 바뀔 때마다 갱신되는, 콜백에서 읽기만 하는 스냅샷 값.
+    private let cachedSettings = OSAllocatedUnfairLock(
+        initialState: (isEnabled: true, excluded: Set<String>())
+    )
+
+    func settingsDidChange() {
+        cachedSettings.withLock {
+            $0 = (settings.isEnabled, settings.excludedBundleIDs)
+        }
+    }
+
+    func start() {
+        guard !isRunning else { return }
+        isRunning = true
+
+        settingsDidChange()
+        dockIndex.start()
+        appState.start()
+
+        let controller = EventTapController(
+            mode: Self.tapMode,
+            decide: { [weak self] point, modifiers in
+                guard let self else { return .ignore }
+                let snapshot = self.cachedSettings.withLock { $0 }
+                return ClickRouter.decide(RouterInput(
+                    point: point,
+                    modifiers: modifiers,
+                    snapshot: self.dockIndex.snapshot,
+                    frontmost: self.appState.frontmost,
+                    minimizedByUs: self.appState.minimizedByUs,
+                    isEnabled: snapshot.isEnabled,
+                    excludedBundleIDs: snapshot.excluded
+                ))
+            },
+            perform: { [weak self] decision in
+                self?.perform(decision)
+            }
+        )
+        controller.start()
+        tapController = controller
+        log.info("Coordinator 시작")
+    }
+
+    func stop() {
+        guard isRunning else { return }
+        isRunning = false
+        tapController?.stop()
+        tapController = nil
+        dockIndex.stop()
+        appState.stop()
+        log.info("Coordinator 중지")
+    }
+
+    /// 이벤트 탭 콜백에서 호출되지만 즉시 비동기로 빠져나간다.
+    /// AX 호출은 전부 이 큐 위에서 일어난다.
+    private func perform(_ decision: Decision) {
+        switch decision {
+        case .ignore:
+            break
+
+        case .letThrough(let pid):
+            appState.clearMinimizedByUs(pid: pid)
+
+        case .minimize(let pid):
+            work.async { [weak self] in
+                guard let self else { return }
+                let count = Minimizer.minimize(pid: pid)
+                if count > 0 {
+                    self.appState.markMinimizedByUs(pid: pid)
+                }
+                self.log.debug("최소화 pid=\(pid) 윈도우=\(count)개")
+            }
+        }
+    }
+}
+```
+
+- [ ] **Step 2: `Sources/DockMinimizer/AppDelegate.swift` 교체**
+
+```swift
+import AppKit
+import DockMinimizerCore
+
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    private let settings = Settings()
+    private var coordinator: Coordinator?
+    private var menuBar: MenuBarController?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        menuBar = MenuBarController()
+
+        let coordinator = Coordinator(settings: settings)
+        coordinator.start()
+        self.coordinator = coordinator
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        coordinator?.stop()
+    }
+}
+```
+
+- [ ] **Step 3: 빌드 및 설치**
+
+Run: `swift build && ./Scripts/install.sh`
+Expected: `완료.`
+
+- [ ] **Step 4: 실제 동작 확인 — 이 프로젝트의 첫 성공 지점**
+
+1. 메모 앱을 열고 윈도우를 하나 띄운다
+2. 메모가 활성 상태인 것을 확인한다
+3. Dock의 메모 아이콘을 클릭한다
+
+Expected: 메모 윈도우가 지니 효과로 최소화된다.
+
+- [ ] **Step 5: 복원 확인 — 이중 가드 검증**
+
+Dock의 메모 아이콘을 한 번 더 클릭한다.
+
+Expected: 최소화된 윈도우가 복원된다. **복원되지 않고 갇히면 이중 가드가 동작하지 않는 것이므로 Task 7과 Task 11로 돌아간다.**
+
+- [ ] **Step 6: 비활성 앱 클릭 확인**
+
+메모가 활성인 상태에서 Dock의 **다른** 앱 아이콘을 클릭한다.
+
+Expected: 그 앱이 평소처럼 활성화된다. 최소화되지 않는다.
+
+- [ ] **Step 7: 로그 확인**
+
+Run: `log show --predicate 'subsystem == "com.changhun.dockminimizer"' --last 2m --info --debug`
+Expected: `최소화 pid=... 윈도우=1개` 형태의 로그. `콜백이 느립니다` 경고가 **없어야** 한다.
+
+- [ ] **Step 8: 커밋**
+
+```bash
+git add -A
+git commit -m "feat: Coordinator 배선 — 첫 동작 완성"
+```
+
+---
+
+# Phase 3 — 설정과 편의 기능
+
+## Task 15: 권한 관리
+
+**Files:**
+- Create: `Sources/DockMinimizer/PermissionsManager.swift`
+- Modify: `Sources/DockMinimizer/AppDelegate.swift`
+
+- [ ] **Step 1: `Sources/DockMinimizer/PermissionsManager.swift` 작성**
+
+```swift
+import AppKit
+import ApplicationServices
+import Combine
+
+/// 접근성 권한의 현재 상태를 관찰 가능한 형태로 노출한다.
+/// 이벤트 탭 생성과 AX 조회 모두 이 권한 하나로 커버된다.
+@MainActor
+final class PermissionsManager: ObservableObject {
+    @Published private(set) var isTrusted: Bool = AXIsProcessTrusted()
+
+    private var timer: Timer?
+
+    /// 권한 상태 변화를 알리는 알림은 없으므로 짧은 주기로 확인한다.
+    /// 사용자가 시스템 설정에서 권한을 끄는 경우도 여기서 잡힌다.
+    func startMonitoring() {
+        timer?.invalidate()
+        let timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                let current = AXIsProcessTrusted()
+                if current != self.isTrusted {
+                    self.isTrusted = current
+                }
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
+    }
+
+    func stopMonitoring() {
+        timer?.invalidate()
+        timer = nil
+    }
+
+    /// 시스템 권한 요청 창을 띄운다.
+    func requestAccess() {
+        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true]
+        _ = AXIsProcessTrustedWithOptions(options as CFDictionary)
+    }
+
+    /// 시스템 설정의 손쉬운 사용 패널을 연다.
+    func openSystemSettings() {
+        guard let url = URL(
+            string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+        ) else { return }
+        NSWorkspace.shared.open(url)
+    }
+}
+```
+
+- [ ] **Step 2: `AppDelegate`에 배선**
+
+`Sources/DockMinimizer/AppDelegate.swift`를 다음으로 교체한다.
+
+```swift
+import AppKit
+import DockMinimizerCore
+
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    let settings = Settings()
+    let permissions = PermissionsManager()
+    private(set) var coordinator: Coordinator?
+    private var menuBar: MenuBarController?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        permissions.startMonitoring()
+
+        let coordinator = Coordinator(settings: settings)
+        self.coordinator = coordinator
+
+        menuBar = MenuBarController(
+            settings: settings,
+            permissions: permissions,
+            coordinator: coordinator
+        )
+
+        if permissions.isTrusted {
+            coordinator.start()
+        } else {
+            permissions.requestAccess()
+        }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        coordinator?.stop()
+        permissions.stopMonitoring()
+    }
+}
+```
+
+`MenuBarController`의 시그니처가 바뀌었으므로 Task 16까지는 빌드가 실패한다. 두 작업을 연속으로 진행한다.
+
+- [ ] **Step 3: 커밋 (Task 16 완료 후)**
+
+이 Task는 Task 16과 함께 커밋한다.
+
+## Task 16: 설정 창
+
+**Files:**
+- Create: `Sources/DockMinimizer/SettingsWindow.swift`
+
+- [ ] **Step 1: `Sources/DockMinimizer/SettingsWindow.swift` 작성**
+
+```swift
+import AppKit
+import DockMinimizerCore
+import SwiftUI
+
+/// 설정 창의 상태를 SwiftUI에 노출하는 어댑터.
+@MainActor
+final class SettingsModel: ObservableObject {
+    @Published var isEnabled: Bool {
+        didSet {
+            settings.isEnabled = isEnabled
+            coordinator.settingsDidChange()
+        }
+    }
+    @Published private(set) var exclusions: [String]
+
+    let settings: Settings
+    let permissions: PermissionsManager
+    private let coordinator: Coordinator
+
+    init(settings: Settings, permissions: PermissionsManager, coordinator: Coordinator) {
+        self.settings = settings
+        self.permissions = permissions
+        self.coordinator = coordinator
+        self.isEnabled = settings.isEnabled
+        self.exclusions = settings.userExcludedBundleIDs.sorted()
+    }
+
+    func addExclusionViaPanel() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.application]
+        panel.allowsMultipleSelection = true
+        panel.directoryURL = URL(fileURLWithPath: "/Applications")
+        panel.prompt = "제외에 추가"
+
+        guard panel.runModal() == .OK else { return }
+        for url in panel.urls {
+            guard let bundleID = Bundle(url: url)?.bundleIdentifier else { continue }
+            settings.addExclusion(bundleID)
+        }
+        reload()
+    }
+
+    func remove(_ bundleID: String) {
+        settings.removeExclusion(bundleID)
+        reload()
+    }
+
+    private func reload() {
+        exclusions = settings.userExcludedBundleIDs.sorted()
+        coordinator.settingsDidChange()
+    }
+}
+
+struct SettingsView: View {
+    @ObservedObject var model: SettingsModel
+    @ObservedObject var permissions: PermissionsManager
+    @State private var selection: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Toggle("Dock 클릭으로 최소화 활성화", isOn: $model.isEnabled)
+                .font(.headline)
+
+            Divider()
+
+            permissionSection
+
+            Divider()
+
+            exclusionSection
+        }
+        .padding(20)
+        .frame(width: 420, height: 400)
+    }
+
+    @ViewBuilder
+    private var permissionSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("접근성 권한").font(.headline)
+            if permissions.isTrusted {
+                Label("권한이 부여되었습니다", systemImage: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
+            } else {
+                Label("권한이 없어 동작하지 않습니다", systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                Button("시스템 설정 열기") {
+                    permissions.openSystemSettings()
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var exclusionSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("제외할 앱").font(.headline)
+            Text("Finder는 항상 제외됩니다.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            List(model.exclusions, id: \.self, selection: $selection) { bundleID in
+                Text(bundleID)
+            }
+            .frame(minHeight: 140)
+
+            HStack {
+                Button("추가...") { model.addExclusionViaPanel() }
+                Button("제거") {
+                    if let selection { model.remove(selection) }
+                }
+                .disabled(selection == nil)
+            }
+        }
+    }
+}
+
+/// 설정 창을 소유하는 컨트롤러. 창을 닫아도 앱이 종료되지 않도록 참조를 유지한다.
+@MainActor
+final class SettingsWindowController {
+    private var window: NSWindow?
+    private let model: SettingsModel
+    private let permissions: PermissionsManager
+
+    init(model: SettingsModel, permissions: PermissionsManager) {
+        self.model = model
+        self.permissions = permissions
+    }
+
+    func show() {
+        if window == nil {
+            let hosting = NSHostingController(
+                rootView: SettingsView(model: model, permissions: permissions)
+            )
+            let window = NSWindow(contentViewController: hosting)
+            window.title = "DockMinimizer 설정"
+            window.styleMask = [.titled, .closable]
+            window.isReleasedWhenClosed = false
+            window.center()
+            self.window = window
+        }
+        // LSUIElement 앱은 기본적으로 창을 앞으로 못 가져오므로 명시적으로 활성화한다.
+        NSApp.activate(ignoringOtherApps: true)
+        window?.makeKeyAndOrderFront(nil)
+    }
+}
+```
+
+- [ ] **Step 2: 다음 Task와 함께 빌드**
+
+`MenuBarController`가 아직 갱신되지 않았으므로 Task 17에서 함께 빌드한다.
+
+## Task 17: 메뉴바 완성
+
+**Files:**
+- Modify: `Sources/DockMinimizer/MenuBarController.swift`
+
+- [ ] **Step 1: `Sources/DockMinimizer/MenuBarController.swift` 전체 교체**
+
+```swift
+import AppKit
+import DockMinimizerCore
+import ServiceManagement
+
+@MainActor
+final class MenuBarController: NSObject, NSMenuDelegate {
+    private let statusItem: NSStatusItem
+    private let settings: Settings
+    private let permissions: PermissionsManager
+    private let coordinator: Coordinator
+    private let settingsWindow: SettingsWindowController
+    private let model: SettingsModel
+
+    private let enabledItem = NSMenuItem(title: "활성화", action: nil, keyEquivalent: "")
+    private let loginItem = NSMenuItem(title: "로그인 시 시작", action: nil, keyEquivalent: "")
+    private let permissionItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+
+    init(settings: Settings, permissions: PermissionsManager, coordinator: Coordinator) {
+        self.settings = settings
+        self.permissions = permissions
+        self.coordinator = coordinator
+        self.model = SettingsModel(
+            settings: settings, permissions: permissions, coordinator: coordinator
+        )
+        self.settingsWindow = SettingsWindowController(model: model, permissions: permissions)
+        self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        super.init()
+
+        statusItem.button?.image = NSImage(
+            systemSymbolName: "dock.arrow.down.rectangle",
+            accessibilityDescription: "DockMinimizer"
+        )
+        statusItem.menu = buildMenu()
+    }
+
+    private func buildMenu() -> NSMenu {
+        let menu = NSMenu()
+        menu.delegate = self
+
+        permissionItem.isEnabled = false
+        menu.addItem(permissionItem)
+        menu.addItem(.separator())
+
+        enabledItem.target = self
+        enabledItem.action = #selector(toggleEnabled)
+        menu.addItem(enabledItem)
+
+        loginItem.target = self
+        loginItem.action = #selector(toggleLoginItem)
+        menu.addItem(loginItem)
+
+        menu.addItem(.separator())
+
+        let settingsItem = NSMenuItem(
+            title: "설정...", action: #selector(openSettings), keyEquivalent: ","
+        )
+        settingsItem.target = self
+        menu.addItem(settingsItem)
+
+        menu.addItem(.separator())
+
+        let quit = NSMenuItem(
+            title: "종료", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"
+        )
+        quit.target = NSApp
+        menu.addItem(quit)
+
+        return menu
+    }
+
+    /// 메뉴가 열릴 때마다 실제 상태를 다시 읽어 체크마크를 맞춘다.
+    func menuWillOpen(_ menu: NSMenu) {
+        enabledItem.state = settings.isEnabled ? .on : .off
+        loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        permissionItem.title = permissions.isTrusted
+            ? "접근성 권한: 정상"
+            : "접근성 권한 없음 — 설정에서 허용 필요"
+    }
+
+    @objc private func toggleEnabled() {
+        settings.isEnabled.toggle()
+        coordinator.settingsDidChange()
+    }
+
+    @objc private func toggleLoginItem() {
+        do {
+            if SMAppService.mainApp.status == .enabled {
+                try SMAppService.mainApp.unregister()
+            } else {
+                try SMAppService.mainApp.register()
+            }
+        } catch {
+            let alert = NSAlert()
+            alert.messageText = "로그인 항목 설정에 실패했습니다"
+            alert.informativeText = error.localizedDescription
+            alert.runModal()
+        }
+    }
+
+    @objc private func openSettings() {
+        settingsWindow.show()
+    }
+}
+```
+
+- [ ] **Step 2: 빌드**
+
+Run: `swift build`
+Expected: `Build complete!`
+
+- [ ] **Step 3: 설치 후 확인**
+
+Run: `./Scripts/install.sh`
+
+메뉴바 아이콘을 클릭해 다음을 확인한다.
+- `접근성 권한: 정상`이 표시된다
+- `활성화`에 체크마크가 있다
+- `활성화`를 끄면 Dock 클릭 최소화가 동작하지 않는다
+- 다시 켜면 동작한다
+
+- [ ] **Step 4: 설정 창 확인**
+
+메뉴에서 `설정...`을 연다. 창이 앞으로 나오고, `추가...`로 앱을 하나 제외에 넣은 뒤 그 앱에서 Dock 클릭이 더 이상 최소화하지 않는지 확인한다. 그 후 제거한다.
+
+- [ ] **Step 5: 로그인 시 시작 확인**
+
+메뉴에서 `로그인 시 시작`을 켠다.
+
+Run: `sfltool dumpbtm 2>/dev/null | grep -A2 dockminimizer || echo "sfltool 사용 불가 — 시스템 설정 > 일반 > 로그인 항목에서 육안 확인"`
+Expected: DockMinimizer가 로그인 항목에 등록되어 있다.
+
+- [ ] **Step 6: 커밋**
+
+```bash
+git add -A
+git commit -m "feat: 권한 관리, 설정 창, 메뉴바 완성"
+```
+
+---
+
+# Phase 4 — 검증과 마무리
+
+## Task 18: 엣지 케이스 검증
+
+**Files:**
+- Create: `docs/superpowers/specs/2026-07-30-verification.md`
+
+- [ ] **Step 1: 검증 문서 생성**
+
+`docs/superpowers/specs/2026-07-30-verification.md`에 아래 체크리스트를 복사하고, 각 항목을 실제로 수행하며 결과(통과 / 실패 + 증상)를 기록한다.
+
+```markdown
+# DockMinimizer 검증 기록
+
+검증일:
+빌드:
+
+## Dock 설정
+- [ ] Dock 확대 켜짐 — 올바른 아이콘이 매칭되는가
+- [ ] Dock 위치 왼쪽
+- [ ] Dock 위치 오른쪽
+- [ ] Dock 자동 숨김 켜짐
+- [ ] 멀티 디스플레이 — Dock이 있는 화면
+- [ ] 멀티 디스플레이 — Dock이 없는 화면(오작동이 없어야 함)
+
+## 클릭 대상
+- [ ] 최근 사용 항목 영역 클릭 — 개입하지 않는다
+- [ ] 스택/폴더 클릭 — 평소대로 열린다
+- [ ] 휴지통 클릭 — 평소대로 열린다
+- [ ] 최소화된 윈도우가 개별 아이콘으로 표시되는 설정에서의 동작
+
+## 앱 상태
+- [ ] 풀스크린 앱 — 최소화되지 않고 기존 동작 유지
+- [ ] 윈도우 0개인 메뉴바 전용 앱 — 개입하지 않는다
+- [ ] 여러 스페이스에 윈도우를 가진 앱
+- [ ] 일부 윈도우만 이미 최소화된 앱 — 나머지만 최소화된다
+- [ ] Finder — 개입하지 않는다
+- [ ] 여러 윈도우를 가진 앱 — 전부 최소화된다
+
+## 입력 변형
+- [ ] 우클릭 — 컨텍스트 메뉴가 정상 표시된다
+- [ ] ⌘클릭 — 개입하지 않는다
+- [ ] 옵션클릭 — 개입하지 않는다
+- [ ] 더블클릭 — 이상 동작이 없다
+- [ ] Dock 아이콘 드래그 — 아이콘 재배열이 정상 동작한다
+
+## 시스템 이벤트
+- [ ] `killall Dock` 후 클릭 — 재인덱싱되어 계속 동작한다
+- [ ] 접근성 권한을 껐다 켜기 — 메뉴바에 상태가 반영된다
+- [ ] 디스플레이 해상도 변경 후 클릭
+- [ ] `./Scripts/install.sh` 재실행 — 접근성 권한이 유지된다
+- [ ] 30분 이상 실행 후에도 동작 유지 (탭이 죽지 않는다)
+```
+
+- [ ] **Step 2: 체크리스트 전수 수행**
+
+각 항목을 실제로 수행한다. 실패한 항목은 증상을 기록하고 원인을 조사한다.
+
+- [ ] **Step 3: 장시간 안정성 확인**
+
+30분 이상 사용한 뒤 로그를 확인한다.
+
+Run: `log show --predicate 'subsystem == "com.changhun.dockminimizer"' --last 30m --info --debug | grep -E '느립니다|비활성화'`
+Expected: 출력이 비어 있다. `이벤트 탭이 비활성화됨`이 반복해 나오면 콜백에 AX 호출이 섞여 든 것이므로 `DockIndex`와 `AppStateCache` 사용부를 다시 점검한다.
+
+- [ ] **Step 4: 실패 항목 수정**
+
+발견된 문제는 근본 원인을 찾아 수정하고, 가능하면 `ClickRouter` 레벨의 회귀 테스트로 고정한 뒤 다시 검증한다.
+
+- [ ] **Step 5: 커밋**
+
+```bash
+git add -A
+git commit -m "test: 엣지 케이스 검증 기록"
+```
+
+## Task 19: README와 마무리
+
+**Files:**
+- Create: `README.md`
+
+- [ ] **Step 1: `README.md` 작성**
+
+```markdown
+# DockMinimizer
+
+활성 상태인 앱의 Dock 아이콘을 클릭하면 그 앱의 윈도우를 최소화하는 macOS 메뉴바 앱.
+한 번 더 클릭하면 복원된다.
+
+## 요구 사항
+
+- macOS 14 이상
+- Swift 6 툴체인 (Xcode 또는 Command Line Tools)
+
+## 설치
+
+```bash
+./Scripts/make-cert.sh   # 최초 1회. 고정 코드서명 인증서를 만든다
+./Scripts/install.sh     # 빌드 후 /Applications 에 설치하고 실행한다
+```
+
+설치 후 **시스템 설정 > 개인정보 보호 및 보안 > 손쉬운 사용**에서
+`/Applications/DockMinimizer.app`을 추가하고 켠다. 이 권한이 없으면 동작하지 않는다.
+
+`make-cert.sh`로 만든 고정 인증서를 쓰기 때문에 재빌드해도 이 권한은 유지된다.
+ad-hoc 서명(`codesign -s -`)을 쓰면 빌드마다 권한이 사라진다.
+
+## 사용
+
+메뉴바 아이콘에서 활성화 여부, 로그인 시 시작, 설정 창을 제어한다.
+설정 창에서 특정 앱을 제외 목록에 넣을 수 있다. Finder는 항상 제외된다.
+
+## 개발
+
+```bash
+swift build          # 빌드
+swift test           # 순수 로직 테스트
+swift run DockProbe  # Dock AX 트리 덤프 (디버깅용)
+swift run DockProbe watch  # 클릭과 아이콘 매칭 실시간 관찰
+```
+
+로그 확인:
+
+```bash
+log show --predicate 'subsystem == "com.changhun.dockminimizer"' --last 10m --info --debug
+```
+
+## 구조
+
+판정 로직 전체가 `DockMinimizerCore`의 순수 함수 `ClickRouter.decide`에 모여 있고
+단위 테스트로 고정되어 있다. 나머지 모듈은 그 함수에 넣을 입력을 준비하고 결과를 실행한다.
+
+가장 중요한 제약은 **이벤트 탭 콜백에서 AX API를 호출하지 않는 것**이다.
+Dock AX 조회는 수십 밀리초가 걸리는 IPC이고, 콜백이 지연되면 macOS가 탭을 조용히 죽여
+"한동안 잘 되다가 갑자기 멈추는" 증상이 나타난다. `DockIndex`와 `AppStateCache`가
+모든 AX 조회를 백그라운드에서 미리 수행해 불변 스냅샷으로 캐싱하는 이유다.
+
+두 번째로 중요한 것은 `ClickRouter`의 **이중 가드**다. 윈도우를 최소화해도 앱은
+프론트모스트로 남기 때문에, "프론트모스트면 최소화"라는 조건만으로는 모든 윈도우가
+최소화된 뒤의 클릭도 최소화로 판정되어 앱을 되살릴 수 없게 된다.
+`minimizedByUs` 집합과 "보이는 윈도우 ≥ 1" 판정이 이를 막는다.
+
+## 알려진 제약
+
+- App Store 배포 불가. 샌드박스가 이벤트 탭 생성을 금지한다
+- 접근성 권한이 필수다
+```
+
+- [ ] **Step 2: 전체 테스트 실행**
+
+Run: `swift test`
+Expected: PASS — 모든 테스트 통과
+
+- [ ] **Step 3: 클린 빌드 확인**
+
+Run: `rm -rf .build build && ./Scripts/install.sh`
+Expected: `완료.` 그리고 접근성 권한이 유지된 채 정상 동작한다.
+
+- [ ] **Step 4: 커밋**
+
+```bash
+git add -A
+git commit -m "docs: README 추가"
+```
