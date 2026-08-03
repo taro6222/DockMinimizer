@@ -20,8 +20,13 @@ final class EventTapController: @unchecked Sendable {
     private let perform: Performer
     private let log = Logger(subsystem: "com.changhun.dockminimizer", category: "eventtap")
 
-    /// mouseDown을 삼켰는지. 탭 스레드에서만 접근한다.
-    private var swallowNextMouseUp = false
+    /// mouseDown을 삼킨 시각(uptime 나노초). 탭 스레드에서만 접근한다.
+    ///
+    /// 시각을 함께 들고 있는 이유: 짝이 되는 mouseUp이 끝내 오지 않을 수 있다
+    /// (제스처 도중 탭이 비활성화되거나, 마스크 밖에서 제스처가 끝나는 경우).
+    /// 불리언만 두면 그 플래그가 남아 한참 뒤의 무관한 클릭을 삼킨다.
+    private var swallowedDownAt: UInt64?
+    private static let swallowWindow: UInt64 = 1_000_000_000  // 1초
 
     private var tap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
@@ -114,9 +119,11 @@ final class EventTapController: @unchecked Sendable {
         }
         // mouseDown을 삼켰다면 짝이 되는 mouseUp도 삼켜야 Dock이 이상 상태에 빠지지 않는다.
         if type == .leftMouseUp {
-            if swallowNextMouseUp {
-                swallowNextMouseUp = false
-                return nil
+            if let downAt = swallowedDownAt {
+                swallowedDownAt = nil
+                if DispatchTime.now().uptimeNanoseconds - downAt < Self.swallowWindow {
+                    return nil
+                }
             }
             return Unmanaged.passUnretained(event)
         }
@@ -136,7 +143,11 @@ final class EventTapController: @unchecked Sendable {
 
         perform(decision)
         // 삼키지 않으면 Dock이 같은 클릭을 처리하며 우리 동작을 원상복구한다.
-        swallowNextMouseUp = true
+        //
+        // 알려진 대가: 프론트모스트 앱 아이콘은 mouseDown이 Dock에 닿지 않으므로
+        // 드래그로 재배열할 수 없다. 드래그를 살리려면 mouseDown을 통과시켜야 하는데,
+        // 그러면 Dock이 우리 최소화를 되돌린다. 둘을 동시에 만족시킬 수 없다.
+        swallowedDownAt = DispatchTime.now().uptimeNanoseconds
         return nil
     }
 

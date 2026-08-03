@@ -1813,6 +1813,14 @@ final class EventTapController: @unchecked Sendable {
     private let perform: Performer
     private let log = Logger(subsystem: "com.changhun.dockminimizer", category: "eventtap")
 
+    /// mouseDown을 삼킨 시각(uptime 나노초). 탭 스레드에서만 접근한다.
+    ///
+    /// 시각을 함께 들고 있는 이유: 짝이 되는 mouseUp이 끝내 오지 않을 수 있다
+    /// (제스처 도중 탭이 비활성화되거나, 마스크 밖에서 제스처가 끝나는 경우).
+    /// 불리언만 두면 그 플래그가 남아 한참 뒤의 무관한 클릭을 삼킨다.
+    private var swallowedDownAt: UInt64?
+    private static let swallowWindow: UInt64 = 1_000_000_000  // 1초
+
     private var tap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private var thread: Thread?
@@ -1852,7 +1860,10 @@ final class EventTapController: @unchecked Sendable {
     }
 
     private func installTap() -> Bool {
-        let mask = CGEventMask(1 << CGEventType.leftMouseDown.rawValue)
+        let mask = CGEventMask(
+            (1 << CGEventType.leftMouseDown.rawValue) |
+            (1 << CGEventType.leftMouseUp.rawValue)
+        )
 
         let callback: CGEventTapCallBack = { _, type, event, refcon in
             guard let refcon else { return Unmanaged.passUnretained(event) }
@@ -1860,11 +1871,16 @@ final class EventTapController: @unchecked Sendable {
             return controller.handle(type: type, event: event)
         }
 
-        // 리슨 전용. 클릭을 삼키지 않으므로 Dock 상호작용을 절대 깨뜨리지 않는다.
+        // 액티브 탭. 우리가 개입하는 클릭은 삼켜야 한다.
+        //
+        // 리슨 전용으로는 동작하지 않는다. 클릭이 Dock에도 전달되면, 우리가 최소화한
+        // 직후 Dock이 같은 클릭을 처리하면서 윈도우를 원상복구한다(100ms 이내로 측정됨).
+        // Phase 0에서 "Dock은 아무 것도 하지 않는다"고 본 것은 되돌릴 대상이 없을 때의
+        // 관찰이었고, 우리 동작과 겹칠 때의 반응은 그것과 다르다.
         guard let tap = CGEvent.tapCreate(
             tap: .cgSessionEventTap,
             place: .headInsertEventTap,
-            options: .listenOnly,
+            options: .defaultTap,
             eventsOfInterest: mask,
             callback: callback,
             userInfo: Unmanaged.passUnretained(self).toOpaque()
@@ -1879,7 +1895,7 @@ final class EventTapController: @unchecked Sendable {
 
         self.tap = tap
         self.runLoopSource = source
-        log.info("이벤트 탭 시작 (listenOnly)")
+        log.info("이벤트 탭 시작 (defaultTap — 개입한 클릭은 삼킨다)")
         return true
     }
 
@@ -1894,6 +1910,16 @@ final class EventTapController: @unchecked Sendable {
             if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
             return Unmanaged.passUnretained(event)
         }
+        // mouseDown을 삼켰다면 짝이 되는 mouseUp도 삼켜야 Dock이 이상 상태에 빠지지 않는다.
+        if type == .leftMouseUp {
+            if let downAt = swallowedDownAt {
+                swallowedDownAt = nil
+                if DispatchTime.now().uptimeNanoseconds - downAt < Self.swallowWindow {
+                    return nil
+                }
+            }
+            return Unmanaged.passUnretained(event)
+        }
         guard type == .leftMouseDown else { return Unmanaged.passUnretained(event) }
 
         let started = DispatchTime.now().uptimeNanoseconds
@@ -1906,11 +1932,16 @@ final class EventTapController: @unchecked Sendable {
         }
 
         let decision = decide(event.location, Self.modifiers(from: event.flags))
-        if decision != .ignore {
-            perform(decision)
-        }
-        // 리슨 전용이므로 항상 이벤트를 그대로 통과시킨다.
-        return Unmanaged.passUnretained(event)
+        guard decision != .ignore else { return Unmanaged.passUnretained(event) }
+
+        perform(decision)
+        // 삼키지 않으면 Dock이 같은 클릭을 처리하며 우리 동작을 원상복구한다.
+        //
+        // 알려진 대가: 프론트모스트 앱 아이콘은 mouseDown이 Dock에 닿지 않으므로
+        // 드래그로 재배열할 수 없다. 드래그를 살리려면 mouseDown을 통과시켜야 하는데,
+        // 그러면 Dock이 우리 최소화를 되돌린다. 둘을 동시에 만족시킬 수 없다.
+        swallowedDownAt = DispatchTime.now().uptimeNanoseconds
+        return nil
     }
 
     private static func modifiers(from flags: CGEventFlags) -> ClickModifiers {
@@ -2638,7 +2669,8 @@ git commit -m "feat: 권한 관리, 설정 창, 메뉴바 완성"
 - [ ] ⌘클릭 — 개입하지 않는다
 - [ ] 옵션클릭 — 개입하지 않는다
 - [ ] 더블클릭 — 이상 동작이 없다
-- [ ] Dock 아이콘 드래그 — 아이콘 재배열이 정상 동작한다
+- [ ] Dock 아이콘 드래그 — **프론트모스트 앱 아이콘을 제외한** 모든 아이콘의 재배열이 정상 동작한다
+- [ ] 프론트모스트 앱 아이콘 드래그 — **동작하지 않는 것이 정상.** 알려진 제약이며, 그 클릭의 mouseDown을 삼키지 않으면 Dock이 우리 최소화를 되돌린다
 
 ## 시스템 이벤트
 - [ ] `killall Dock` 후 클릭 — 재인덱싱되어 계속 동작한다
