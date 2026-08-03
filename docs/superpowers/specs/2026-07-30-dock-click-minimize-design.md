@@ -10,7 +10,7 @@
 성공 기준:
 
 - 프론트모스트 앱의 Dock 아이콘 클릭 → 해당 앱의 모든 표준 윈도우가 최소화된다
-- 한 번 더 클릭 → Dock 기본 동작으로 복원된다 (앱이 되살아나지 않는 상태에 갇히지 않는다)
+- 한 번 더 클릭 → 복원된다 (앱이 되살아나지 않는 상태에 갇히지 않는다)
 - 프론트모스트가 아닌 앱의 아이콘 클릭 → 기존 동작(활성화) 그대로
 - Dock의 다른 상호작용(우클릭 메뉴, 드래그, 스택, 휴지통)을 깨뜨리지 않는다
 - 장시간 실행해도 동작이 멈추지 않는다
@@ -21,6 +21,7 @@
 - 서드파티 앱이 다른 앱의 Dock 아이콘 클릭을 알아내는 공개 API는 존재하지 않는다. `NSWorkspace` 활성화 알림은 활성화의 원인이 Dock 클릭인지 알려주지 않는다. SIP 우회 및 코드 인젝션은 범위 밖이다. 따라서 `CGEventTap`으로 마우스 클릭을 관찰하고 Dock 프로세스의 접근성(AX) 트리에서 아이콘 프레임을 조회해 어느 아이콘이 눌렸는지 역산하는 방식이 유일한 경로다.
 - 접근성 권한이 없으면 Dock의 AX 트리는 빈 값을 반환한다 (실측 확인: `AXIsProcessTrusted: false`인 상태에서 루트 엘리먼트의 role/children이 모두 비어 있음). 접근성 권한 하나로 이벤트 탭 생성과 AX 조회가 모두 커버된다.
 - App Store 배포는 불가능하다. 샌드박스가 이벤트 탭 생성을 금지한다.
+- Phase 0 실측으로 다음이 확정되었다 (`2026-07-30-phase0-findings.md`): AX 좌표와 `CGEvent.location`은 같은 공간이라 변환이 불필요하고, Dock 항목은 `subrole == "AXApplicationDockItem"`으로 걸러야 하며(폴더 항목도 `AXURL`을 가진다), 윈도우는 최소화되면 subrole이 `AXStandardWindow`에서 `AXDialog`로 바뀌므로 subrole로 필터하면 안 된다.
 
 ## 3. 결정 사항
 
@@ -40,10 +41,10 @@
 |---|---|---|
 | `PermissionsManager` | 접근성 권한 확인·요청, 시스템 설정 딥링크, 사후 회수 감지 | AX API |
 | `DockIndex` | Dock AX 트리 → `[DockItem]` 불변 스냅샷 캐시 및 갱신 | AX API, NSWorkspace |
-| `AppStateCache` | frontmost pid/bundleID, 앱별 "보이는 윈도우 ≥ 1" 여부, `minimizedByUs` 집합 | NSWorkspace 알림, AXObserver |
+| `AppStateCache` | frontmost pid/bundleID, 보이는/최소화된 윈도우 유무, 정착 구간 | NSWorkspace 알림, 타이머 |
 | `ClickRouter` | **순수 로직.** (클릭 좌표, 스냅샷, 앱 상태, 설정) → `Decision` | 없음 |
 | `EventTapController` | 이벤트 탭 생성·수명 관리·비활성화 복구 | CGEvent API |
-| `Minimizer` | 대상 앱의 표준 윈도우에 `kAXMinimized = true` 설정 | AX API |
+| `WindowController` | 대상 앱 윈도우의 `kAXMinimized` 설정·해제 | AX API |
 | `Settings` | 활성화 여부, 제외 목록, 로그인 시작 | UserDefaults, SMAppService |
 | `MenuBarController` | 메뉴바 아이콘과 메뉴 | AppKit |
 | `SettingsWindow` | 설정 UI | SwiftUI |
@@ -52,20 +53,26 @@
 
 ```swift
 struct DockItem {
-    let frame: CGRect        // 전역 디스플레이 좌표 (좌상단 원점)
+    let frame: CGRect        // 전역 디스플레이 좌표 (좌상단 원점, CGEvent.location과 동일)
     let bundleID: String?
     let title: String?
 }
 
 struct DockSnapshot {
     let items: [DockItem]
-    let generation: UInt64
+}
+
+struct AppState {
+    let pid: pid_t
+    let bundleID: String
+    let hasVisibleWindows: Bool     // 최소화되지 않은 대상 윈도우 ≥ 1
+    let hasMinimizedWindows: Bool   // 최소화된 대상 윈도우 ≥ 1
 }
 
 enum Decision: Equatable {
-    case ignore                 // Dock 아이콘이 아님 / 비활성 상태 / 제외 앱
-    case minimize(pid: pid_t)   // 최소화 수행
-    case letThrough(pid: pid_t) // Dock 기본 동작에 맡김 (복원 등)
+    case ignore                 // 우리 관심사가 아님
+    case minimize(pid: pid_t)
+    case restore(pid: pid_t)    // Dock이 복원하지 않으므로 우리가 한다
 }
 ```
 
@@ -81,20 +88,22 @@ EventTapController 콜백  ── AX 호출 절대 금지, 마이크로초 단�
       ▼                                                              │
 ClickRouter.decide(...) → Decision                                   │
       │                                                              │
-      ├─ .ignore / .letThrough → 즉시 반환                            │
-      └─ .minimize(pid) → 백그라운드 큐로 async dispatch ─────────────┘
+      ├─ .ignore → 즉시 반환                                        │
+      └─ .minimize / .restore → 백그라운드 큐로 async dispatch ───────┘
                                 │
                                 ▼
-                          Minimizer.minimize(pid)
+              WindowController.minimize / .restore (AX)
                                 │
-                                ▼
-                    AppStateCache.minimizedByUs.insert(pid)
+                                ├─→ AppStateCache 즉시 갱신 + 800ms 정착 구간
+                                │
+                                └─→ DockIndex.refresh() 즉시 + 700ms 후 한 번 더
+                                     (최소화가 Dock 폭을 바꿔 모든 아이콘이 밀리므로)
 
 [백그라운드 갱신 경로]
-NSWorkspace 알림(앱 실행/종료/활성화) ┐
+NSWorkspace 알림(앱 실행/종료/숨김)   ┐
 화면 구성 변경 알림                    ├→ 시리얼 큐에서 AX 조회
-Dock 프로세스 재시작 감지              │   → 새 DockSnapshot 생성
-저빈도 안전망 타이머                   ┘   → 원자적으로 교체
+우리 동작 직후 / 700ms 후              │   → 새 DockSnapshot 생성
+1초 안전망 타이머                      ┘   → 원자적으로 교체
 ```
 
 ## 5. 최우선 제약: 이벤트 탭 콜백에서 AX 호출 금지
@@ -107,43 +116,46 @@ Dock 프로세스 재시작 감지              │   → 새 DockSnapshot 생�
 
 1. 콜백은 **캐시된 불변 스냅샷 읽기 + 사각형 히트테스트 + pid 정수 비교**만 수행한다. 락 없이 스냅샷 참조를 원자적으로 교체하는 방식을 쓴다.
 2. `NSWorkspace.frontmostApplication`도 IPC일 수 있으므로 콜백에서 호출하지 않는다. `didActivateApplicationNotification`으로 미리 캐싱한 값을 읽는다.
-3. "보이는 윈도우 ≥ 1" 판정도 AX 호출이므로 콜백에서 하지 않는다. `AppStateCache`가 미리 계산해 둔다.
+3. 윈도우 상태 판정(보이는 윈도우 / 최소화된 윈도우 유무)도 AX 호출이므로 콜백에서 하지 않는다. `AppStateCache`가 미리 계산해 둔다.
 4. `kCGEventTapDisabledByTimeout`과 `kCGEventTapDisabledByUserInput`을 명시적으로 처리해 `CGEventTapEnable(tap, true)`로 재활성화하고 경고 로그를 남긴다.
 5. 콜백 실행 시간을 계측해 임계값 초과 시 진단 로그를 남긴다.
 
-## 6. Minimize 방식의 무한 스왈로우 위험과 이중 가드
+## 6. 복원 경로 — 3분기 판정 (Phase 0 실측으로 개정)
 
-Hide(`NSRunningApplication.hide()`)와 달리 `kAXMinimized = true`는 앱을 프론트모스트로 남긴다. 따라서 "프론트모스트면 최소화"라는 가드만 두면, 모든 윈도우가 최소화된 뒤의 다음 클릭도 최소화로 판정되어 **앱을 영원히 되살릴 수 없게 된다.**
+Hide(`NSRunningApplication.hide()`)와 달리 `kAXMinimized = true`는 앱을 프론트모스트로 남긴다. 당초 설계는 "우리는 개입하지 않고 Dock의 기본 복원에 맡긴다(`.letThrough`)"로 이 문제를 해결하려 했다.
 
-이중 가드로 대응한다.
+**Phase 0 실측 결과 그 기본 복원은 존재하지 않는다.** 프론트모스트 앱의 윈도우가 전부 최소화된 상태에서 Dock 아이콘을 몇 번 클릭해도 아무 일도 일어나지 않는다. 우리가 만들어 내는 상태가 정확히 그 상태이므로, 원안대로 구현하면 사용자가 앱을 되살릴 수 없다.
 
-**가드 1 — `minimizedByUs: Set<pid_t>` 상태 (주 방어선)**
+**따라서 복원도 우리가 직접 수행한다.** 판정은 프론트모스트 앱의 윈도우 상태에 따른 3분기가 된다.
 
-- `pid ∉ minimizedByUs`이고 프론트모스트 → `.minimize(pid)`. 수행 후 집합에 추가
-- `pid ∈ minimizedByUs` → `.letThrough(pid)`. 개입하지 않고 Dock 기본 복원에 맡기며 집합에서 제거
+| 조건 | 판정 | 근거 |
+|---|---|---|
+| 프론트모스트가 아님 | `.ignore` | Dock이 활성화 + 복원을 알아서 한다 (실측 상태 4) |
+| 프론트모스트 + 보이는 윈도우 ≥ 1 | `.minimize(pid)` | |
+| 프론트모스트 + 보이는 윈도우 0, 최소화된 윈도우 ≥ 1 | `.restore(pid)` | Dock이 복원하지 않으므로 우리가 한다 |
+| 프론트모스트 + 윈도우 없음 | `.ignore` | 메뉴바 전용 앱. 복원할 것이 없다 |
 
-O(1)이고 AX 호출이 없어 콜백에서 안전하게 평가된다.
+마지막 분기가 필요한 이유: `hasVisibleWindows == false`는 "전부 최소화됨"과 "윈도우가 아예 없음"을 구분하지 못한다. `hasMinimizedWindows`를 함께 두어 판정을 완전하게 만든다.
 
-집합 정리 트리거 (사용자가 직접 ⌘M 하거나 수동 복원한 경우와의 불일치 해소):
+### 캐시 정착 구간
 
-- 대상 앱에 `kAXWindowDeminiaturizedNotification` AXObserver 등록 → 발생 시 집합에서 제거
-- 앱 종료 알림 → 집합에서 제거
-- 우리 앱 비활성화 시 집합 전체 비우기
+`AppStateCache`는 0.5초 주기로 AX를 다시 읽는다. 우리가 최소화/복원한 직후에는 AX가 아직 이전 상태를 보고할 수 있고, 그러면 타이머가 방금 갱신한 캐시를 되돌려 다음 클릭이 같은 방향으로 다시 동작한다.
 
-**가드 2 — 보이는 윈도우 개수 (백업 방어선)**
+**대응:** 동작 직후 캐시를 즉시 갱신하고, 그 뒤 800ms 동안은 타이머의 덮어쓰기를 막는다(정착 구간). 최소화와 복원 양쪽에 대칭으로 적용한다.
 
-`AppStateCache`가 관리하는 "보이는(최소화되지 않은) 표준 윈도우 ≥ 1" 판정이 거짓이면 `.letThrough`. 윈도우가 0개인 메뉴바 전용 앱과 가드 1의 상태가 어긋난 경우를 함께 막는다.
+### 최소화가 Dock 레이아웃을 바꾼다
 
-두 가드 중 하나라도 "최소화할 것이 없다"고 판단하면 개입하지 않는다.
+"윈도우를 앱 아이콘으로 최소화"가 꺼져 있으면(기본값) 최소화된 윈도우가 Dock에 **별도 아이콘으로 추가된다.** Dock은 가운데 정렬이므로 폭이 넓어지면 전체가 재정렬되어 **모든 앱 아이콘의 x좌표가 약 22pt(아이콘 폭의 절반) 밀린다.**
 
-## 7. 클릭 삼킴 여부: Phase 0에서 결정
+`DockIndex`의 갱신 트리거(앱 실행/종료/숨김/화면 변경/1초 타이머) 중 어느 것도 윈도우 최소화로는 발화하지 않는다. 그래서 최대 1초간 캐시가 어긋나고, 그 사이의 클릭이 **이웃 앱을 최소화한다.**
 
-기본 macOS에서 이미 활성 상태인 앱의 Dock 아이콘 클릭은 사실상 무동작이다. 이것이 사실이라면 클릭을 삼킬 필요가 없다.
+**대응:** 최소화/복원을 수행한 직후와 지니 애니메이션이 끝난 뒤(약 700ms) 각각 `DockIndex.refresh()`를 호출한다.
 
-- **Plan A (선호)**: `kCGEventTapOptionListenOnly` 패시브 탭. 클릭을 관찰만 하고 최소화를 수행한다. Dock 상호작용을 절대 깨뜨리지 않고, 삼킴 상태머신이 불필요하며, 타임아웃으로 인한 탭 비활성화 위험도 크게 낮다.
-- **Plan B (대비)**: `kCGEventTapOptionDefault` 액티브 탭. `.minimize` 판정 시 `kCGEventLeftMouseDown`과 이어지는 `kCGEventLeftMouseUp`을 **쌍으로** 삼킨다. mouseDown만 삼키면 Dock이 이상 상태에 빠진다. 이를 위해 `pendingSwallow: pid_t?` 상태를 콜백 내에서 관리한다.
+## 7. 클릭 삼킴 불필요 — Plan A 확정 (Phase 0 실측)
 
-Phase 0의 실측으로 결정한다. Plan A로 확정되면 `EventTapController`의 복잡도가 한 단계 내려간다. `ClickRouter`의 `Decision` 타입은 두 경로 모두를 지원하므로 이 결정이 다른 모듈에 파급되지 않는다.
+우리가 개입하는 세 상태(프론트모스트 + 보임 / 전부 최소화 / 일부 최소화) 모두에서 Dock의 기본 동작은 **아무 것도 하지 않는 것**으로 측정되었다.
+
+따라서 클릭을 삼킬 필요가 없고 `kCGEventTapOptionListenOnly` 패시브 탭으로 충분하다. 액티브 탭의 삼킴 상태머신이 불필요하고, Dock 상호작용을 깨뜨릴 위험도 없으며, 타임아웃으로 탭이 죽을 위험도 낮다.
 
 ## 8. Phase 0 스파이크 (게이트)
 
@@ -173,11 +185,11 @@ TCC 권한은 코드 서명과 번들 ID에 묶인다. 서명이 바뀌면 권�
 
 **Phase 2 — 핵심 로직 (테스트 우선)**
 
-- `ClickRouter` 단위 테스트 작성 후 구현
-- `DockIndex` 캐시와 갱신 트리거
-- `EventTapController` (Plan A 또는 B) 및 비활성화 복구
-- `AppStateCache`와 이중 가드
-- `Minimizer`
+- `ClickRouter` 단위 테스트 작성 후 구현 (3분기 판정)
+- `DockIndex` 캐시와 갱신 트리거 (동작 직후 갱신 포함)
+- `EventTapController` (리슨 전용) 및 비활성화 복구
+- `AppStateCache` — 윈도우 상태와 정착 구간
+- `WindowController` — 최소화와 복원
 
 **Phase 3 — 설정과 편의 기능**
 
@@ -218,7 +230,8 @@ Dock 설정:
 - [ ] Dock의 최근 사용 항목 영역
 - [ ] 스택 및 폴더
 - [ ] 휴지통
-- [ ] 최소화된 윈도우가 개별 아이콘으로 표시되는 설정
+- [ ] **"윈도우를 앱 아이콘으로 최소화" 끔 (기본값)** — 최소화가 Dock 폭을 바꿔 모든 아이콘이 밀린다. 연속 클릭 시 이웃 앱이 최소화되지 않는지
+- [ ] **"윈도우를 앱 아이콘으로 최소화" 켬** — 위 문제가 사라지는 설정. 둘 다 확인해야 함
 
 앱 상태:
 
@@ -240,18 +253,21 @@ Dock 설정:
 - [ ] `killall Dock` 후 pid 변경 → 재인덱싱
 - [ ] 이벤트 탭 강제 비활성화 → 자동 복구
 - [ ] 접근성 권한 사후 회수 → 감지 및 안내
+- [ ] 기능을 끄거나 앱을 제외한 뒤에도, 전부 최소화된 앱을 Dock의 최소화 윈도우 항목으로 복구할 수 있는지
 - [ ] 화면 해상도 / 디스플레이 배치 변경
 - [ ] 장시간 실행 (수 시간) 후에도 동작 유지
 
 ## 12. 대안과 폐기 사유
 
-- **Hide 방식 (`NSRunningApplication.hide()`)** — 앱이 프론트모스트에서 빠지므로 §6의 무한 스왈로우 문제가 구조적으로 사라지고 이중 가드가 불필요하다. 요구사항의 "최소화"라는 표현에 문자적으로 맞지 않아 채택하지 않았으나, 구현 중 이중 가드가 불안정한 것으로 판명되면 가장 빠른 해결책이다. `Minimizer`를 전략 프로토콜로 두어 전환 비용을 낮춰 둔다.
+- **Hide 방식 (`NSRunningApplication.hide()`)** — 앱이 프론트모스트에서 빠지므로 Dock의 기본 활성화가 곧 복원이 되고, §6의 복원 문제가 발생하지 않는다. 요구사항의 "최소화"라는 표현에 문자적으로 맞지 않아 채택하지 않았다. `.restore` 분기로 해결했으므로 전환 필요성은 사라졌으나, 최소화 방식이 특정 앱에서 문제를 일으키면 여전히 가장 단순한 대안이다.
 - **`NSWorkspace` 활성화 알림만 사용** — 활성화의 원인이 Dock 클릭인지 알 수 없어 키보드 전환(⌘Tab) 등과 구분되지 않는다.
 - **코드 인젝션 / SIP 우회** — 범위 밖.
 - **App Store 배포** — 샌드박스가 이벤트 탭을 금지하므로 불가능.
 
 ## 13. 열린 항목
 
-- Dock 확대가 켜진 상태의 처리 방침 — Phase 0 항목 3의 실측 결과에 따라 결정한다.
-- Plan A / Plan B 선택 — Phase 0 항목 4의 실측 결과에 따라 결정한다.
-- 배포 대상 최소 macOS 버전 — 로컬 사용이므로 개발 머신 기준(macOS 26)으로 두되, `SMAppService`(macOS 13+) 외에 특별한 하한 제약은 없다. Phase 1에서 확정한다.
+- **Dock 확대 지원.** AX 프레임이 확대에 영향받지 않음(Case B)은 확정했으나, 확대 중에도 정적 프레임 히트테스트가 올바른지는 측정하지 못했다. 보수적으로 확대가 켜진 동안 기능을 일시 중지한다. 지원하려면 별도 실험이 필요하다
+- **멀티 디스플레이.** 단일 디스플레이 환경에서 측정해 확인하지 못했다. Phase 4 검증 항목
+- **Dock 위치 좌/우, 자동 숨김.** Phase 4 검증 항목
+
+실측 결과 전체는 `2026-07-30-phase0-findings.md`에 있다.

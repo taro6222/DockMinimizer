@@ -25,8 +25,8 @@
 | `Sources/DockMinimizer/AppDelegate.swift` | 수명 관리, 모듈 배선 |
 | `Sources/DockMinimizer/AXHelpers.swift` | AX 속성 조회 헬퍼 (얇은 래퍼) |
 | `Sources/DockMinimizer/DockIndex.swift` | Dock AX 트리 → `DockSnapshot` 캐시와 갱신 |
-| `Sources/DockMinimizer/AppStateCache.swift` | frontmost, 보이는 윈도우 여부, `minimizedByUs` |
-| `Sources/DockMinimizer/Minimizer.swift` | 대상 앱 윈도우 최소화 |
+| `Sources/DockMinimizer/AppStateCache.swift` | frontmost, 보이는/최소화된 윈도우 유무, 정착 구간 |
+| `Sources/DockMinimizer/WindowController.swift` | 대상 앱 윈도우의 최소화·복원 |
 | `Sources/DockMinimizer/EventTapController.swift` | 이벤트 탭 수명 관리와 복구 |
 | `Sources/DockMinimizer/Coordinator.swift` | 위 모듈들을 잇는 조립부 |
 | `Sources/DockMinimizer/PermissionsManager.swift` | 접근성 권한 확인·요청·감시 |
@@ -841,16 +841,28 @@ public struct DockSnapshot: Equatable, Sendable {
 import Foundation
 
 /// 판정에 필요한 프론트모스트 앱의 상태. AX 조회 결과를 미리 계산해 담아 둔 값이다.
+///
+/// 두 플래그가 모두 필요하다. `hasVisibleWindows == false` 하나만으로는
+/// "전부 최소화됨"(복원해야 함)과 "윈도우가 아예 없음"(메뉴바 전용 앱, 개입 불가)을
+/// 구분할 수 없다.
 public struct AppState: Equatable, Sendable {
     public let pid: pid_t
     public let bundleID: String
-    /// 최소화되지 않은 표준 윈도우가 하나 이상 있는가.
+    /// 최소화되지 않은 대상 윈도우가 하나 이상 있는가.
     public let hasVisibleWindows: Bool
+    /// 최소화된 대상 윈도우가 하나 이상 있는가.
+    public let hasMinimizedWindows: Bool
 
-    public init(pid: pid_t, bundleID: String, hasVisibleWindows: Bool) {
+    public init(
+        pid: pid_t,
+        bundleID: String,
+        hasVisibleWindows: Bool,
+        hasMinimizedWindows: Bool
+    ) {
         self.pid = pid
         self.bundleID = bundleID
         self.hasVisibleWindows = hasVisibleWindows
+        self.hasMinimizedWindows = hasMinimizedWindows
     }
 }
 ```
@@ -870,6 +882,8 @@ git commit -m "feat: DockSnapshot 히트테스트와 Core 값 타입"
 ## Task 7: ClickRouter 판정 로직
 
 앱의 모든 판정이 여기 모인다. AX도 CGEvent도 건드리지 않는 순수 함수이므로 전 분기를 테스트로 고정한다.
+
+**Phase 0 실측 반영:** Dock은 프론트모스트 앱을 복원하지 않는다(`2026-07-30-phase0-findings.md` §5). 따라서 당초의 `.letThrough`(Dock 기본 복원에 맡김)는 성립하지 않고, 복원도 우리가 수행하는 `.restore`가 된다. 판정은 3분기다.
 
 **Files:**
 - Create: `Sources/DockMinimizerCore/ClickRouter.swift`
@@ -897,12 +911,20 @@ private let notesIcon = DockItem(
 private let onSafari = CGPoint(x: 25, y: 1025)
 private let onNotes = CGPoint(x: 125, y: 1025)
 
+private func safari(visible: Bool, minimized: Bool) -> AppState {
+    AppState(
+        pid: 42,
+        bundleID: "com.apple.Safari",
+        hasVisibleWindows: visible,
+        hasMinimizedWindows: minimized
+    )
+}
+
 private func makeInput(
     point: CGPoint = onSafari,
     modifiers: ClickModifiers = [],
     items: [DockItem] = [safariIcon, notesIcon],
-    frontmost: AppState? = AppState(pid: 42, bundleID: "com.apple.Safari", hasVisibleWindows: true),
-    minimizedByUs: Set<pid_t> = [],
+    frontmost: AppState? = safari(visible: true, minimized: false),
     isEnabled: Bool = true,
     excluded: Set<String> = []
 ) -> RouterInput {
@@ -911,16 +933,12 @@ private func makeInput(
         modifiers: modifiers,
         snapshot: DockSnapshot(items: items),
         frontmost: frontmost,
-        minimizedByUs: minimizedByUs,
         isEnabled: isEnabled,
         excludedBundleIDs: excluded
     )
 }
 
-@Test("프론트모스트 앱의 아이콘 클릭은 최소화한다")
-func minimizesFrontmostApp() {
-    #expect(ClickRouter.decide(makeInput()) == .minimize(pid: 42))
-}
+// MARK: - 개입하지 않는 경우
 
 @Test("비활성 상태에서는 개입하지 않는다")
 func ignoresWhenDisabled() {
@@ -950,7 +968,7 @@ func ignoresExcludedApps() {
     #expect(ClickRouter.decide(makeInput(excluded: ["com.apple.Safari"])) == .ignore)
 }
 
-@Test("프론트모스트가 아닌 앱의 아이콘 클릭은 개입하지 않는다")
+@Test("프론트모스트가 아닌 앱의 아이콘 클릭은 개입하지 않는다 — Dock이 활성화·복원한다")
 func ignoresNonFrontmostApp() {
     #expect(ClickRouter.decide(makeInput(point: onNotes)) == .ignore)
 }
@@ -960,32 +978,41 @@ func ignoresWhenNoFrontmostApp() {
     #expect(ClickRouter.decide(makeInput(frontmost: nil)) == .ignore)
 }
 
-// 이중 가드 — 이 두 테스트가 "앱이 되살아나지 않는" 사고를 막는다.
-
-@Test("가드 1: 우리가 최소화한 앱은 통과시켜 Dock 기본 복원에 맡긴다")
-func letsThroughWhenAlreadyMinimizedByUs() {
-    #expect(ClickRouter.decide(makeInput(minimizedByUs: [42])) == .letThrough(pid: 42))
+@Test("윈도우가 아예 없는 메뉴바 전용 앱은 개입하지 않는다")
+func ignoresAppWithNoWindows() {
+    let front = safari(visible: false, minimized: false)
+    #expect(ClickRouter.decide(makeInput(frontmost: front)) == .ignore)
 }
 
-@Test("가드 2: 보이는 윈도우가 없으면 통과시킨다")
-func letsThroughWhenNoVisibleWindows() {
-    let front = AppState(pid: 42, bundleID: "com.apple.Safari", hasVisibleWindows: false)
-    #expect(ClickRouter.decide(makeInput(frontmost: front)) == .letThrough(pid: 42))
+// MARK: - 3분기 판정
+
+@Test("프론트모스트 + 보이는 윈도우 있음 → 최소화")
+func minimizesFrontmostAppWithVisibleWindows() {
+    #expect(ClickRouter.decide(makeInput()) == .minimize(pid: 42))
 }
 
-@Test("최소화 후 복원, 그리고 재최소화가 순환한다")
+@Test("프론트모스트 + 보이는 윈도우 없고 최소화된 윈도우 있음 → 복원")
+func restoresFrontmostAppWithOnlyMinimizedWindows() {
+    let front = safari(visible: false, minimized: true)
+    #expect(ClickRouter.decide(makeInput(frontmost: front)) == .restore(pid: 42))
+}
+
+@Test("일부만 최소화된 앱은 남은 것을 최소화한다")
+func minimizesWhenPartiallyMinimized() {
+    let front = safari(visible: true, minimized: true)
+    #expect(ClickRouter.decide(makeInput(frontmost: front)) == .minimize(pid: 42))
+}
+
+@Test("최소화 → 복원 → 재최소화가 순환한다")
 func minimizeRestoreMinimizeCycle() {
-    // 1회차: 최소화
+    // 1회차: 보이는 윈도우가 있으니 최소화
     #expect(ClickRouter.decide(makeInput()) == .minimize(pid: 42))
 
-    // 2회차: 우리가 최소화한 상태 → 통과 (Dock이 복원)
-    let afterMinimize = makeInput(
-        frontmost: AppState(pid: 42, bundleID: "com.apple.Safari", hasVisibleWindows: false),
-        minimizedByUs: [42]
-    )
-    #expect(ClickRouter.decide(afterMinimize) == .letThrough(pid: 42))
+    // 2회차: 전부 최소화된 상태. Dock은 복원하지 않으므로 우리가 복원
+    let allMinimized = makeInput(frontmost: safari(visible: false, minimized: true))
+    #expect(ClickRouter.decide(allMinimized) == .restore(pid: 42))
 
-    // 3회차: 복원되어 상태가 정리된 뒤 → 다시 최소화
+    // 3회차: 복원되었으니 다시 최소화
     #expect(ClickRouter.decide(makeInput()) == .minimize(pid: 42))
 }
 ```
@@ -1018,7 +1045,6 @@ public struct RouterInput: Sendable {
     public let modifiers: ClickModifiers
     public let snapshot: DockSnapshot
     public let frontmost: AppState?
-    public let minimizedByUs: Set<pid_t>
     public let isEnabled: Bool
     public let excludedBundleIDs: Set<String>
 
@@ -1027,7 +1053,6 @@ public struct RouterInput: Sendable {
         modifiers: ClickModifiers,
         snapshot: DockSnapshot,
         frontmost: AppState?,
-        minimizedByUs: Set<pid_t>,
         isEnabled: Bool,
         excludedBundleIDs: Set<String>
     ) {
@@ -1035,20 +1060,17 @@ public struct RouterInput: Sendable {
         self.modifiers = modifiers
         self.snapshot = snapshot
         self.frontmost = frontmost
-        self.minimizedByUs = minimizedByUs
         self.isEnabled = isEnabled
         self.excludedBundleIDs = excludedBundleIDs
     }
 }
 
 public enum Decision: Equatable, Sendable {
-    /// 우리 관심사가 아니다. Plan B에서도 이벤트를 삼키지 않는다.
+    /// 우리 관심사가 아니다. 아무 것도 하지 않는다.
     case ignore
-    /// 이 앱을 최소화한다. Plan B에서는 이 경우에만 이벤트를 삼킨다.
     case minimize(pid: pid_t)
-    /// 우리 앱 아이콘이고 프론트모스트지만 의도적으로 최소화하지 않는다.
-    /// Dock 기본 복원 동작에 맡기고, 호출자는 minimizedByUs에서 pid를 제거해야 한다.
-    case letThrough(pid: pid_t)
+    /// Dock은 프론트모스트 앱을 복원하지 않으므로 우리가 직접 복원한다.
+    case restore(pid: pid_t)
 }
 
 /// 앱의 모든 판정이 모이는 순수 함수. AX도 CGEvent도 호출하지 않으므로
@@ -1062,26 +1084,22 @@ public enum ClickRouter {
 
         guard let item = input.snapshot.item(at: input.point) else { return .ignore }
 
-        // 휴지통, 스택, 폴더처럼 앱이 아닌 항목은 bundleID가 없다.
+        // 휴지통, 스택, 구분선처럼 앱이 아닌 항목.
         guard let bundleID = item.bundleID else { return .ignore }
 
         guard !input.excludedBundleIDs.contains(bundleID) else { return .ignore }
 
-        // 프론트모스트가 아닌 앱은 Dock 기본 동작(활성화)을 그대로 둔다.
+        // 프론트모스트가 아닌 앱은 Dock이 알아서 활성화하고 복원한다 (Phase 0 상태 4).
         guard let front = input.frontmost, front.bundleID == bundleID else { return .ignore }
 
-        // 가드 1: 우리가 최소화한 앱이면 복원 클릭이다. 삼키면 앱을 되살릴 수 없게 된다.
-        if input.minimizedByUs.contains(front.pid) {
-            return .letThrough(pid: front.pid)
-        }
+        // 보이는 윈도우가 하나라도 있으면 그것들을 최소화한다.
+        if front.hasVisibleWindows { return .minimize(pid: front.pid) }
 
-        // 가드 2: 최소화할 윈도우가 없으면 개입할 이유가 없다.
-        // 윈도우 없는 메뉴바 전용 앱과 가드 1의 상태 드리프트를 함께 막는다.
-        guard front.hasVisibleWindows else {
-            return .letThrough(pid: front.pid)
-        }
+        // 전부 최소화된 상태. Dock은 이 상태의 프론트모스트 앱을 복원하지 않는다.
+        if front.hasMinimizedWindows { return .restore(pid: front.pid) }
 
-        return .minimize(pid: front.pid)
+        // 윈도우가 아예 없는 앱(메뉴바 전용 등). 최소화할 것도 복원할 것도 없다.
+        return .ignore
     }
 }
 ```
@@ -1089,13 +1107,13 @@ public enum ClickRouter {
 - [ ] **Step 4: 테스트 통과 확인**
 
 Run: `swift test --filter ClickRouterTests`
-Expected: PASS — 11 tests passed
+Expected: PASS — 12 tests passed
 
 - [ ] **Step 5: 커밋**
 
 ```bash
 git add -A
-git commit -m "feat: ClickRouter 판정 로직과 이중 가드"
+git commit -m "feat: ClickRouter 3분기 판정 로직"
 ```
 
 ## Task 8: 설정 모델
@@ -1233,7 +1251,7 @@ Expected: PASS — 6 tests passed
 - [ ] **Step 5: 전체 테스트 실행**
 
 Run: `swift test`
-Expected: PASS — 23 tests passed
+Expected: PASS — 24 tests passed
 
 - [ ] **Step 6: 커밋**
 
@@ -1332,9 +1350,13 @@ git commit -m "feat: AX API 래퍼"
 
 ## Task 10: DockIndex 캐시
 
-**전제:** Task 1~2의 findings 문서를 먼저 읽는다. 아래 코드는 "AXList를 재귀로 전부 수집하고, `AXURL`에서 bundleID를 얻으며, 좌표 변환이 필요 없고, Dock 확대는 **Case B**(AX 프레임이 정적)"라는 가정으로 작성되었다.
+**Phase 0 실측 반영** (`2026-07-30-phase0-findings.md`):
 
-**findings가 Case A(AX 프레임이 확대를 실시간 반영)라면 Step 4를 반드시 수행한다.** 그 경우 1초 주기 캐시는 확대가 켜진 동안 매 클릭마다 틀리므로, 캐시 설계 자체를 바꿔야 한다. 이는 부분 수정이 아니라 Task 10과 Task 13에 걸친 변경이다.
+- `AXList`는 1개지만 재귀 수집을 유지한다 (구조 변경 대비 비용이 거의 없다)
+- **`subrole == "AXApplicationDockItem"`으로 먼저 걸러야 한다.** 폴더 항목도 `AXURL`을 가지므로 "bundleID가 nil이면 앱이 아니다"에만 의존하면 위험하다
+- 좌표 변환은 불필요하다
+- 확대는 **Case B**(AX 프레임이 정적). 확대가 켜진 동안에는 기능을 일시 중지한다
+- **최소화는 Dock의 폭을 바꾼다.** 최소화된 윈도우가 별도 아이콘으로 추가되고 Dock이 가운데 정렬을 다시 하므로 모든 아이콘의 x좌표가 약 22pt 밀린다. 이 변화는 어떤 알림으로도 통보되지 않으므로 우리 동작 직후 직접 갱신해야 한다
 
 **Files:**
 - Create: `Sources/DockMinimizer/DockIndex.swift`
@@ -1360,6 +1382,15 @@ final class DockIndex: @unchecked Sendable {
     private var refreshTimer: DispatchSourceTimer?
     private var observers: [NSObjectProtocol] = []
 
+    /// Dock 확대가 켜져 있는가.
+    ///
+    /// 실측 결과 AX 프레임은 확대의 영향을 받지 않는다(Case B). 확대 중에는 아이콘이
+    /// 시각적으로 커지고 이웃이 밀려나므로 사용자가 클릭한 좌표와 정적 프레임이
+    /// 어긋날 수 있고, 그 어긋남의 크기는 측정하지 못했다. 오작동보다 일시 중지가 낫다.
+    static var isDockMagnificationEnabled: Bool {
+        UserDefaults(suiteName: "com.apple.dock")?.bool(forKey: "magnification") ?? false
+    }
+
     /// 이벤트 탭 콜백이 호출하는 유일한 메서드. 락 획득과 배열 참조 복사만 한다.
     var snapshot: DockSnapshot {
         storage.withLock { $0 }
@@ -1383,9 +1414,20 @@ final class DockIndex: @unchecked Sendable {
 
     func refresh() {
         queue.async { [weak self] in
-            guard let self else { return }
-            let fresh = self.buildSnapshot()
-            self.storage.withLock { $0 = fresh }
+            self?.rebuild()
+        }
+    }
+
+    /// 우리가 최소화·복원한 직후에 호출한다.
+    ///
+    /// 최소화된 윈도우는 Dock에 별도 아이콘으로 추가되고, Dock은 가운데 정렬이므로
+    /// 폭이 바뀌면 **모든 앱 아이콘의 x좌표가 밀린다.** 갱신하지 않으면 다음 클릭이
+    /// 이웃 앱을 최소화한다. 지니 애니메이션이 진행 중일 수 있으므로 즉시 한 번,
+    /// 애니메이션이 끝난 뒤 한 번 더 읽는다.
+    func refreshAfterWindowChange() {
+        refresh()
+        queue.asyncAfter(deadline: .now() + 0.7) { [weak self] in
+            self?.rebuild()
         }
     }
 
@@ -1417,14 +1459,12 @@ final class DockIndex: @unchecked Sendable {
     }
 
     /// 안전망. 위 알림으로 잡히지 않는 변화(Dock 설정 변경, Dock 재시작, 아이콘 재배열)를
-    /// 짧은 주기로 흡수한다. 아이콘 30개 수준의 AX 순회는 백그라운드에서 충분히 가볍다.
+    /// 흡수한다. 아이콘 30여 개의 AX 순회는 백그라운드에서 충분히 가볍다.
     private func startTimer() {
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + 1.0, repeating: 1.0)
         timer.setEventHandler { [weak self] in
-            guard let self else { return }
-            let fresh = self.buildSnapshot()
-            self.storage.withLock { $0 = fresh }
+            self?.rebuild()
         }
         timer.resume()
         refreshTimer = timer
@@ -1432,7 +1472,15 @@ final class DockIndex: @unchecked Sendable {
 
     // MARK: - AX 조회 (반드시 queue 위에서만 실행)
 
+    private func rebuild() {
+        let fresh = buildSnapshot()
+        storage.withLock { $0 = fresh }
+    }
+
     private func buildSnapshot() -> DockSnapshot {
+        // 빈 스냅샷이면 ClickRouter가 자연히 .ignore를 낸다. 별도 분기가 필요 없다.
+        guard !Self.isDockMagnificationEnabled else { return .empty }
+
         guard let dock = NSRunningApplication
             .runningApplications(withBundleIdentifier: "com.apple.dock").first else {
             return .empty
@@ -1446,6 +1494,10 @@ final class DockIndex: @unchecked Sendable {
         var items: [DockItem] = []
         for list in lists {
             for element in AX.children(list) {
+                // 구분선, 폴더, 최소화된 윈도우, 휴지통을 여기서 배제한다.
+                // 폴더 항목도 AXURL을 가지므로 bundleID 판정만으로는 걸러지지 않는다.
+                guard AX.string(element, kAXSubroleAttribute as String)
+                    == "AXApplicationDockItem" else { continue }
                 guard let frame = AX.frame(element), frame.width > 0, frame.height > 0 else {
                     continue
                 }
@@ -1459,7 +1511,7 @@ final class DockIndex: @unchecked Sendable {
         return DockSnapshot(items: items)
     }
 
-    /// Dock은 앱 / 최근 항목 / 휴지통을 별개의 AXList로 나눠 가질 수 있으므로 전부 수집한다.
+    /// 실측에서는 AXList가 1개였지만, 구조가 바뀌어도 따라가도록 재귀로 수집한다.
     private func collectLists(_ element: AXUIElement, depth: Int, into result: inout [AXUIElement]) {
         guard depth <= 6 else { return }
         if AX.string(element, kAXRoleAttribute as String) == "AXList" {
@@ -1486,133 +1538,7 @@ final class DockIndex: @unchecked Sendable {
 Run: `swift build`
 Expected: `Build complete!`
 
-- [ ] **Step 3: Case B라면 확대 감지와 일시 중지 추가**
-
-findings가 Case B(AX 프레임이 정적)라면, 확대가 켜진 동안에는 히트테스트가 어긋나므로 기능을 끈다. `DockIndex`에 다음을 추가한다.
-
-```swift
-    /// Dock 확대가 켜져 있는가. Case B에서는 확대 중에 히트테스트가 어긋나므로
-    /// 기능을 일시 중지하는 근거로 쓴다.
-    static var isDockMagnificationEnabled: Bool {
-        UserDefaults(suiteName: "com.apple.dock")?.bool(forKey: "magnification") ?? false
-    }
-```
-
-그리고 `buildSnapshot()`의 맨 앞에 다음을 넣어, 확대 중에는 빈 스냅샷을 반환해 `ClickRouter`가 자연히 `.ignore`를 내도록 한다.
-
-```swift
-        guard !Self.isDockMagnificationEnabled else { return .empty }
-```
-
-메뉴바 표시는 Task 17 Step 1의 `menuWillOpen`에서 `permissionItem.title`을 정할 때 다음 분기를 추가한다.
-
-```swift
-        if DockIndex.isDockMagnificationEnabled {
-            permissionItem.title = "Dock 확대가 켜져 있어 일시 중지됨"
-        } else if permissions.isTrusted {
-            permissionItem.title = "접근성 권한: 정상"
-        } else {
-            permissionItem.title = "접근성 권한 없음 — 설정에서 허용 필요"
-        }
-```
-
-- [ ] **Step 4: Case A라면 커서 연동 갱신으로 교체**
-
-findings가 Case A(AX 프레임이 실시간 확대 반영)라면, 고정 1초 주기로는 확대 상태를 따라갈 수 없다. 커서가 Dock 영역에 있을 때만 갱신 주기를 올린다.
-
-`DockIndex`에 다음을 추가한다.
-
-```swift
-    /// 커서가 Dock 영역 안에 있다고 마지막으로 보고된 시각(uptime 나노초).
-    /// EventTapController가 mouseMoved 콜백에서 갱신한다. 콜백은 이 값을 쓰기만 하고
-    /// AX는 건드리지 않으므로 콜백 예산을 넘지 않는다.
-    private let cursorInDockAt = OSAllocatedUnfairLock(initialState: UInt64(0))
-
-    /// Dock 영역(가장 최근 스냅샷의 아이콘들을 감싸는 사각형)을 조금 넉넉히 잡은 값.
-    var dockRegion: CGRect {
-        let items = snapshot.items
-        guard !items.isEmpty else { return .null }
-        return items.dropFirst()
-            .reduce(items[0].frame) { $0.union($1.frame) }
-            .insetBy(dx: -40, dy: -40)
-    }
-
-    func noteCursorInDock() {
-        cursorInDockAt.withLock { $0 = DispatchTime.now().uptimeNanoseconds }
-    }
-
-    private var cursorRecentlyInDock: Bool {
-        let last = cursorInDockAt.withLock { $0 }
-        guard last > 0 else { return false }
-        return DispatchTime.now().uptimeNanoseconds - last < 300_000_000  // 300ms
-    }
-```
-
-`startTimer()`의 주기를 30ms로 바꾸고, 커서가 Dock 근처에 없으면 대부분의 틱을 건너뛴다.
-
-```swift
-    private func startTimer() {
-        let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now() + 0.03, repeating: 0.03)
-        var tickCount = 0
-        timer.setEventHandler { [weak self] in
-            guard let self else { return }
-            tickCount += 1
-            // 커서가 Dock 근처면 매 틱(30ms), 아니면 33틱마다(약 1초) 갱신한다.
-            guard self.cursorRecentlyInDock || tickCount % 33 == 0 else { return }
-            let fresh = self.buildSnapshot()
-            self.storage.withLock { $0 = fresh }
-        }
-        timer.resume()
-        refreshTimer = timer
-    }
-```
-
-`EventTapController`의 마스크에 `mouseMoved`를 추가하고, 콜백 최상단에서 좌표만 확인해 보고한다. Task 13 Step 1의 코드에 다음을 반영한다.
-
-`installTap()`의 마스크:
-
-```swift
-        let mask = CGEventMask(
-            (1 << CGEventType.leftMouseDown.rawValue) |
-            (1 << CGEventType.leftMouseUp.rawValue) |
-            (1 << CGEventType.mouseMoved.rawValue)
-        )
-```
-
-`EventTapController`에 커서 보고용 콜백을 추가한다.
-
-```swift
-    /// 커서가 Dock 영역 안에 있을 때 호출된다. 반드시 AX 호출 없이 즉시 반환해야 한다.
-    typealias CursorReporter = (CGPoint) -> Void
-```
-
-`init`에 `reportCursor: @escaping CursorReporter` 파라미터를 추가해 저장하고, `handle`의 `type == .tapDisabled...` 분기 바로 다음에 넣는다.
-
-```swift
-        if type == .mouseMoved {
-            reportCursor(event.location)
-            return Unmanaged.passUnretained(event)
-        }
-```
-
-`Coordinator.start()`에서 이 콜백을 연결한다.
-
-```swift
-            reportCursor: { [weak self] point in
-                guard let self else { return }
-                if self.dockIndex.dockRegion.contains(point) {
-                    self.dockIndex.noteCursorInDock()
-                }
-            },
-```
-
-- [ ] **Step 5: 빌드 확인**
-
-Run: `swift build`
-Expected: `Build complete!`
-
-- [ ] **Step 6: 커밋**
+- [ ] **Step 3: 커밋**
 
 ```bash
 git add -A
@@ -1620,6 +1546,8 @@ git commit -m "feat: DockIndex — Dock AX 트리 스냅샷 캐시"
 ```
 
 ## Task 11: AppStateCache
+
+**Phase 0 실측 반영:** 최소화하면 윈도우의 subrole이 `AXStandardWindow`에서 `AXDialog`로 바뀐다. subrole로 필터하면 최소화된 윈도우가 목록에서 사라진 것처럼 보이고 복원 대상을 찾지 못한다. `AXMinimized` 속성 보유를 기준으로 삼고, 최소화 대상이 아닌 subrole만 제외한다.
 
 **Files:**
 - Create: `Sources/DockMinimizer/AppStateCache.swift`
@@ -1632,15 +1560,21 @@ import ApplicationServices
 import DockMinimizerCore
 import os
 
-/// 프론트모스트 앱의 상태와 `minimizedByUs` 집합을 캐싱한다.
+/// 프론트모스트 앱의 윈도우 상태를 캐싱한다.
 ///
 /// DockIndex와 같은 이유로 존재한다. `NSWorkspace.frontmostApplication`과 윈도우 목록
 /// 조회는 모두 IPC일 수 있으므로 이벤트 탭 콜백에서 호출하지 않고 여기서 미리 계산해 둔다.
 final class AppStateCache: @unchecked Sendable {
     private struct State: Sendable {
         var frontmost: AppState?
-        var minimizedByUs: Set<pid_t> = []
+        /// 이 시각까지는 타이머 갱신이 캐시를 덮어쓰지 않는다.
+        var settleUntil: UInt64 = 0
     }
+
+    /// 우리가 최소화·복원한 직후 AX가 아직 이전 상태를 보고할 수 있다. 그 사이 타이머가
+    /// 캐시를 되돌리면 다음 클릭이 같은 방향으로 다시 동작한다(토글이 한쪽으로 죽는다).
+    /// 동작 직후 이 시간만큼 타이머 갱신을 막는다.
+    private static let settleDuration: UInt64 = 800_000_000  // 800ms
 
     private let queue = DispatchQueue(label: "com.changhun.dockminimizer.appstate")
     private let storage = OSAllocatedUnfairLock(initialState: State())
@@ -1650,10 +1584,6 @@ final class AppStateCache: @unchecked Sendable {
     /// 이벤트 탭 콜백이 읽는 값.
     var frontmost: AppState? {
         storage.withLock { $0.frontmost }
-    }
-
-    var minimizedByUs: Set<pid_t> {
-        storage.withLock { $0.minimizedByUs }
     }
 
     func start() {
@@ -1671,52 +1601,49 @@ final class AppStateCache: @unchecked Sendable {
         observers.removeAll()
     }
 
-    /// Minimizer가 실제로 윈도우를 최소화한 직후 호출한다.
-    func markMinimizedByUs(pid: pid_t) {
-        storage.withLock { state in
-            state.minimizedByUs.insert(pid)
-            if var front = state.frontmost, front.pid == pid {
-                front = AppState(
-                    pid: front.pid,
-                    bundleID: front.bundleID,
-                    hasVisibleWindows: false
-                )
-                state.frontmost = front
-            }
-        }
+    /// 최소화를 수행한 직후 호출한다.
+    func markMinimized(pid: pid_t) {
+        apply(pid: pid, hasVisibleWindows: false, hasMinimizedWindows: true)
     }
 
-    /// ClickRouter가 `.letThrough`를 반환했을 때 호출한다. Dock이 복원할 것이므로
-    /// 우리 상태에서도 지운다.
-    func clearMinimizedByUs(pid: pid_t) {
-        storage.withLock { $0.minimizedByUs.remove(pid) }
+    /// 복원을 수행한 직후 호출한다. markMinimized와 대칭이어야 한다.
+    /// 이 짝이 없으면 복원 후에도 캐시가 "보이는 윈도우 없음"으로 남아
+    /// 다음 클릭이 다시 .restore로 판정되고 아무 일도 일어나지 않는다.
+    func markRestored(pid: pid_t) {
+        apply(pid: pid, hasVisibleWindows: true, hasMinimizedWindows: false)
+    }
+
+    private func apply(pid: pid_t, hasVisibleWindows: Bool, hasMinimizedWindows: Bool) {
+        storage.withLock { state in
+            guard let front = state.frontmost, front.pid == pid else { return }
+            state.frontmost = AppState(
+                pid: front.pid,
+                bundleID: front.bundleID,
+                hasVisibleWindows: hasVisibleWindows,
+                hasMinimizedWindows: hasMinimizedWindows
+            )
+            state.settleUntil = DispatchTime.now().uptimeNanoseconds + Self.settleDuration
+        }
     }
 
     // MARK: - 갱신
 
     private func registerObservers() {
         let center = NSWorkspace.shared.notificationCenter
-        observers.append(center.addObserver(
-            forName: NSWorkspace.didActivateApplicationNotification,
-            object: nil, queue: nil
-        ) { [weak self] _ in
-            self?.refresh()
-        })
-
-        observers.append(center.addObserver(
-            forName: NSWorkspace.didTerminateApplicationNotification,
-            object: nil, queue: nil
-        ) { [weak self] notification in
-            guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey]
-                as? NSRunningApplication else { return }
-            self?.storage.withLock { $0.minimizedByUs.remove(app.processIdentifier) }
-            self?.refresh()
-        })
+        for name in [
+            NSWorkspace.didActivateApplicationNotification,
+            NSWorkspace.didTerminateApplicationNotification,
+        ] {
+            observers.append(center.addObserver(
+                forName: name, object: nil, queue: nil
+            ) { [weak self] _ in
+                self?.refresh()
+            })
+        }
     }
 
-    /// 불변식 복구용 안전망. 사용자가 ⌘Tab이나 Mission Control로 윈도우를 되살리면
-    /// 알림이 오지 않으므로, 짧은 주기로 실제 상태를 다시 읽어 minimizedByUs를 정리한다.
-    /// 앱 하나의 윈도우 목록 조회이므로 비용이 작다.
+    /// 사용자가 ⌘M, ⌘Tab, Mission Control로 윈도우 상태를 바꾸면 알림이 오지 않으므로
+    /// 짧은 주기로 실제 상태를 다시 읽는다. 앱 하나의 윈도우 목록 조회라 비용이 작다.
     private func startTimer() {
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + 0.5, repeating: 0.5)
@@ -1734,82 +1661,102 @@ final class AppStateCache: @unchecked Sendable {
     }
 
     private func performRefresh() {
+        // 정착 구간 중에는 우리가 방금 넣은 값을 신뢰한다.
+        let settling = storage.withLock {
+            DispatchTime.now().uptimeNanoseconds < $0.settleUntil
+        }
+        guard !settling else { return }
+
         guard let app = NSWorkspace.shared.frontmostApplication,
               let bundleID = app.bundleIdentifier else {
             storage.withLock { $0.frontmost = nil }
             return
         }
         let pid = app.processIdentifier
-        let visible = Self.hasVisibleWindows(pid: pid)
+        let counts = WindowController.windowCounts(pid: pid)
 
         storage.withLock { state in
-            state.frontmost = AppState(pid: pid, bundleID: bundleID, hasVisibleWindows: visible)
-            // 보이는 윈도우가 다시 생겼다면 우리 최소화 상태는 더 이상 유효하지 않다.
-            if visible {
-                state.minimizedByUs.remove(pid)
-            }
+            state.frontmost = AppState(
+                pid: pid,
+                bundleID: bundleID,
+                hasVisibleWindows: counts.visible > 0,
+                hasMinimizedWindows: counts.minimized > 0
+            )
         }
-    }
-
-    /// 최소화되지 않은 표준 윈도우가 하나 이상 있는가.
-    static func hasVisibleWindows(pid: pid_t) -> Bool {
-        let element = AX.application(pid: pid)
-        for window in AX.windows(element) {
-            guard AX.string(window, kAXSubroleAttribute as String) == (kAXStandardWindowSubrole as String) else {
-                continue
-            }
-            if AX.bool(window, kAXMinimizedAttribute as String) == true { continue }
-            return true
-        }
-        return false
     }
 }
 ```
 
-- [ ] **Step 2: 빌드 확인**
+- [ ] **Step 2: 빌드 확인 (Task 12 이후)**
 
-Run: `swift build`
-Expected: `Build complete!`
+`WindowController`가 아직 없으므로 Task 12까지는 빌드가 실패한다. 두 작업을 연속으로 진행한다.
 
-- [ ] **Step 3: 커밋**
+## Task 12: WindowController — 최소화와 복원
 
-```bash
-git add -A
-git commit -m "feat: AppStateCache — 프론트모스트 상태와 minimizedByUs 불변식"
-```
-
-## Task 12: Minimizer
+Dock은 프론트모스트 앱을 복원하지 않으므로(Phase 0 §5) 복원도 우리가 수행한다. 최소화와 복원이 같은 술어를 공유해야 하므로 한 타입에 둔다.
 
 **Files:**
-- Create: `Sources/DockMinimizer/Minimizer.swift`
+- Create: `Sources/DockMinimizer/WindowController.swift`
 
-- [ ] **Step 1: `Sources/DockMinimizer/Minimizer.swift` 작성**
+- [ ] **Step 1: `Sources/DockMinimizer/WindowController.swift` 작성**
 
 ```swift
 import AppKit
 import ApplicationServices
 
-/// 대상 앱의 표준 윈도우를 최소화한다. AX 호출이므로 백그라운드 큐에서만 실행한다.
-enum Minimizer {
+/// 대상 앱 윈도우의 최소화 상태를 읽고 바꾼다. AX 호출이므로 백그라운드 큐에서만 실행한다.
+enum WindowController {
+    /// 최소화 대상에서 제외할 subrole.
+    ///
+    /// `kAXStandardWindowSubrole`로 **거르면 안 된다.** 실측 결과 윈도우를 최소화하면
+    /// subrole이 AXStandardWindow에서 AXDialog로 바뀌므로, 그렇게 거르면 최소화된 윈도우가
+    /// 목록에서 사라진 것처럼 보이고 복원 대상을 찾지 못한다.
+    /// 대신 AXMinimized 속성을 가진 윈도우를 대상으로 하고 시트류만 제외한다.
+    private static let excludedSubroles: Set<String> = [
+        "AXSheet",
+        "AXSystemDialog",
+        "AXSystemFloatingWindow",
+    ]
+
+    /// (윈도우, 현재 최소화 여부) 목록.
+    private static func targets(pid: pid_t) -> [(window: AXUIElement, minimized: Bool)] {
+        let app = AX.application(pid: pid)
+        var result: [(AXUIElement, Bool)] = []
+        for window in AX.windows(app) {
+            let subrole = AX.string(window, kAXSubroleAttribute as String) ?? ""
+            guard !excludedSubroles.contains(subrole) else { continue }
+            // AXMinimized 속성이 없는 윈도우는 최소화 대상이 아니다.
+            guard let minimized = AX.bool(window, kAXMinimizedAttribute as String) else { continue }
+            // 풀스크린 윈도우는 최소화할 수 없다. 시도하면 실패하거나 이상 동작을 한다.
+            if AX.bool(window, "AXFullScreen") == true { continue }
+            result.append((window, minimized))
+        }
+        return result
+    }
+
+    /// AppStateCache가 3분기 판정에 쓰는 값.
+    static func windowCounts(pid: pid_t) -> (visible: Int, minimized: Int) {
+        let all = targets(pid: pid)
+        let minimized = all.filter(\.minimized).count
+        return (all.count - minimized, minimized)
+    }
+
     /// 최소화한 윈도우 개수를 반환한다. 0이면 최소화할 것이 없었다는 뜻이다.
     @discardableResult
     static func minimize(pid: pid_t) -> Int {
-        let element = AX.application(pid: pid)
         var count = 0
+        for (window, minimized) in targets(pid: pid) where !minimized {
+            if AX.setBool(window, kAXMinimizedAttribute as String, true) { count += 1 }
+        }
+        return count
+    }
 
-        for window in AX.windows(element) {
-            // 시트, 팝오버, 플로팅 패널은 건드리지 않는다.
-            guard AX.string(window, kAXSubroleAttribute as String) == (kAXStandardWindowSubrole as String) else {
-                continue
-            }
-            // 이미 최소화된 윈도우는 건너뛴다.
-            if AX.bool(window, kAXMinimizedAttribute as String) == true { continue }
-            // 풀스크린 윈도우는 최소화할 수 없다. 시도하면 실패하거나 이상 동작을 한다.
-            if AX.bool(window, "AXFullScreen") == true { continue }
-
-            if AX.setBool(window, kAXMinimizedAttribute as String, true) {
-                count += 1
-            }
+    /// 복원한 윈도우 개수를 반환한다.
+    @discardableResult
+    static func restore(pid: pid_t) -> Int {
+        var count = 0
+        for (window, minimized) in targets(pid: pid) where minimized {
+            if AX.setBool(window, kAXMinimizedAttribute as String, false) { count += 1 }
         }
         return count
     }
@@ -1825,12 +1772,12 @@ Expected: `Build complete!`
 
 ```bash
 git add -A
-git commit -m "feat: Minimizer — 표준 윈도우 최소화"
+git commit -m "feat: AppStateCache와 WindowController — 윈도우 상태 캐시, 최소화·복원"
 ```
 
 ## Task 13: EventTapController
 
-**전제:** Task 2 Step 4의 Plan A / Plan B 판정 결과를 확인한다. 아래 코드는 두 모드를 모두 지원하며, `TapMode` 기본값만 바꾸면 된다. Plan A로 판정되었으면 `.listenOnly`, Plan B면 `.active`를 쓴다.
+**Phase 0 실측 반영:** 우리가 개입하는 모든 상태에서 Dock의 기본 동작은 "아무 것도 하지 않음"이었다. 따라서 **클릭을 삼킬 필요가 없고 리슨 전용 탭으로 충분하다 (Plan A 확정).** 액티브 탭 분기와 mouseUp 삼킴 상태머신은 넣지 않는다 — 쓰이지 않을 코드를 테스트 없이 남기는 것보다 없는 편이 낫다. 필요해지면 findings 문서의 측정 절차를 다시 돌려 판단한다.
 
 **Files:**
 - Create: `Sources/DockMinimizer/EventTapController.swift`
@@ -1851,19 +1798,11 @@ import os
 /// 2. kCGEventTapDisabledByTimeout / ByUserInput을 잡아 즉시 재활성화한다.
 ///    이 처리가 없으면 "한동안 잘 되다가 갑자기 멈추는" 증상이 나타난다.
 final class EventTapController: @unchecked Sendable {
-    enum TapMode {
-        /// Plan A. 클릭을 관찰만 한다. Dock 상호작용을 절대 깨뜨리지 않는다.
-        case listenOnly
-        /// Plan B. `.minimize` 판정 시 mouseDown/mouseUp을 쌍으로 삼킨다.
-        case active
-    }
-
     /// 클릭 좌표와 수정자를 받아 판정을 돌려주는 콜백. 반드시 AX 호출 없이 즉시 반환해야 한다.
     typealias Decider = (CGPoint, ClickModifiers) -> Decision
     /// 판정 결과에 따른 실제 동작. 백그라운드로 비동기 디스패치된다.
     typealias Performer = (Decision) -> Void
 
-    private let mode: TapMode
     private let decide: Decider
     private let perform: Performer
     private let log = Logger(subsystem: "com.changhun.dockminimizer", category: "eventtap")
@@ -1873,12 +1812,7 @@ final class EventTapController: @unchecked Sendable {
     private var thread: Thread?
     private var threadRunLoop: CFRunLoop?
 
-    /// Plan B에서만 쓴다. mouseDown을 삼켰다면 짝이 되는 mouseUp도 삼켜야
-    /// Dock이 이상 상태에 빠지지 않는다.
-    private var swallowNextMouseUp = false
-
-    init(mode: TapMode, decide: @escaping Decider, perform: @escaping Performer) {
-        self.mode = mode
+    init(decide: @escaping Decider, perform: @escaping Performer) {
         self.decide = decide
         self.perform = perform
     }
@@ -1912,10 +1846,7 @@ final class EventTapController: @unchecked Sendable {
     }
 
     private func installTap() -> Bool {
-        let mask = CGEventMask(
-            (1 << CGEventType.leftMouseDown.rawValue) |
-            (1 << CGEventType.leftMouseUp.rawValue)
-        )
+        let mask = CGEventMask(1 << CGEventType.leftMouseDown.rawValue)
 
         let callback: CGEventTapCallBack = { _, type, event, refcon in
             guard let refcon else { return Unmanaged.passUnretained(event) }
@@ -1923,10 +1854,11 @@ final class EventTapController: @unchecked Sendable {
             return controller.handle(type: type, event: event)
         }
 
+        // 리슨 전용. 클릭을 삼키지 않으므로 Dock 상호작용을 절대 깨뜨리지 않는다.
         guard let tap = CGEvent.tapCreate(
             tap: .cgSessionEventTap,
             place: .headInsertEventTap,
-            options: mode == .listenOnly ? .listenOnly : .defaultTap,
+            options: .listenOnly,
             eventsOfInterest: mask,
             callback: callback,
             userInfo: Unmanaged.passUnretained(self).toOpaque()
@@ -1941,7 +1873,7 @@ final class EventTapController: @unchecked Sendable {
 
         self.tap = tap
         self.runLoopSource = source
-        log.info("이벤트 탭 시작 (mode=\(String(describing: self.mode), privacy: .public))")
+        log.info("이벤트 탭 시작 (listenOnly)")
         return true
     }
 
@@ -1956,9 +1888,9 @@ final class EventTapController: @unchecked Sendable {
             if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
             return Unmanaged.passUnretained(event)
         }
+        guard type == .leftMouseDown else { return Unmanaged.passUnretained(event) }
 
         let started = DispatchTime.now().uptimeNanoseconds
-
         defer {
             let elapsedMicroseconds = (DispatchTime.now().uptimeNanoseconds - started) / 1_000
             // 예산을 크게 밑돌아야 정상이다. 넘어가면 캐시 밖 호출이 섞여 든 것이다.
@@ -1967,35 +1899,12 @@ final class EventTapController: @unchecked Sendable {
             }
         }
 
-        if type == .leftMouseUp {
-            if mode == .active, swallowNextMouseUp {
-                swallowNextMouseUp = false
-                return nil
-            }
-            return Unmanaged.passUnretained(event)
-        }
-
-        guard type == .leftMouseDown else { return Unmanaged.passUnretained(event) }
-
         let decision = decide(event.location, Self.modifiers(from: event.flags))
-
-        switch decision {
-        case .ignore:
-            return Unmanaged.passUnretained(event)
-
-        case .letThrough(let pid):
-            // 상태 정리는 콜백 밖에서 한다.
-            perform(.letThrough(pid: pid))
-            return Unmanaged.passUnretained(event)
-
-        case .minimize(let pid):
-            perform(.minimize(pid: pid))
-            if mode == .active {
-                swallowNextMouseUp = true
-                return nil
-            }
-            return Unmanaged.passUnretained(event)
+        if decision != .ignore {
+            perform(decision)
         }
+        // 리슨 전용이므로 항상 이벤트를 그대로 통과시킨다.
+        return Unmanaged.passUnretained(event)
     }
 
     private static func modifiers(from flags: CGEventFlags) -> ClickModifiers {
@@ -2009,20 +1918,16 @@ final class EventTapController: @unchecked Sendable {
 }
 ```
 
-- [ ] **Step 2: Phase 0 판정에 따라 모드 확정**
-
-findings 문서의 Plan A / Plan B 판정을 확인한다. Task 14의 `Coordinator`에서 이 값을 넘긴다.
-
-- [ ] **Step 3: 빌드 확인**
+- [ ] **Step 2: 빌드 확인**
 
 Run: `swift build`
 Expected: `Build complete!`
 
-- [ ] **Step 4: 커밋**
+- [ ] **Step 3: 커밋**
 
 ```bash
 git add -A
-git commit -m "feat: EventTapController — 전용 스레드 런루프와 탭 복구"
+git commit -m "feat: EventTapController — 리슨 전용 탭, 전용 스레드, 비활성화 복구"
 ```
 
 ## Task 14: Coordinator 배선
@@ -2033,8 +1938,6 @@ git commit -m "feat: EventTapController — 전용 스레드 런루프와 탭 �
 
 - [ ] **Step 1: `Sources/DockMinimizer/Coordinator.swift` 작성**
 
-Phase 0에서 Plan A로 판정되었다면 `tapMode`를 `.listenOnly`로, Plan B면 `.active`로 둔다.
-
 ```swift
 import AppKit
 import DockMinimizerCore
@@ -2042,14 +1945,16 @@ import os
 
 /// 캐시, 판정, 실행을 잇는 조립부.
 final class Coordinator: @unchecked Sendable {
-    /// Phase 0 실측 결과에 따라 결정된다. findings 문서 참조.
-    static let tapMode: EventTapController.TapMode = .listenOnly
-
     private let settings: Settings
     private let dockIndex = DockIndex()
     private let appState = AppStateCache()
     private let work = DispatchQueue(label: "com.changhun.dockminimizer.work")
     private let log = Logger(subsystem: "com.changhun.dockminimizer", category: "coordinator")
+
+    /// 설정이 바뀔 때만 갱신되는, 콜백에서 읽기 전용으로 쓰는 스냅샷.
+    private let cachedSettings = OSAllocatedUnfairLock(
+        initialState: (isEnabled: true, excluded: Set<String>())
+    )
 
     private var tapController: EventTapController?
     private var isRunning = false
@@ -2057,11 +1962,6 @@ final class Coordinator: @unchecked Sendable {
     init(settings: Settings) {
         self.settings = settings
     }
-
-    /// 설정이 바뀔 때마다 갱신되는, 콜백에서 읽기만 하는 스냅샷 값.
-    private let cachedSettings = OSAllocatedUnfairLock(
-        initialState: (isEnabled: true, excluded: Set<String>())
-    )
 
     func settingsDidChange() {
         cachedSettings.withLock {
@@ -2078,7 +1978,6 @@ final class Coordinator: @unchecked Sendable {
         appState.start()
 
         let controller = EventTapController(
-            mode: Self.tapMode,
             decide: { [weak self] point, modifiers in
                 guard let self else { return .ignore }
                 let snapshot = self.cachedSettings.withLock { $0 }
@@ -2087,7 +1986,6 @@ final class Coordinator: @unchecked Sendable {
                     modifiers: modifiers,
                     snapshot: self.dockIndex.snapshot,
                     frontmost: self.appState.frontmost,
-                    minimizedByUs: self.appState.minimizedByUs,
                     isEnabled: snapshot.isEnabled,
                     excludedBundleIDs: snapshot.excluded
                 ))
@@ -2118,17 +2016,29 @@ final class Coordinator: @unchecked Sendable {
         case .ignore:
             break
 
-        case .letThrough(let pid):
-            appState.clearMinimizedByUs(pid: pid)
-
         case .minimize(let pid):
             work.async { [weak self] in
                 guard let self else { return }
-                let count = Minimizer.minimize(pid: pid)
+                let count = WindowController.minimize(pid: pid)
                 if count > 0 {
-                    self.appState.markMinimizedByUs(pid: pid)
+                    self.appState.markMinimized(pid: pid)
+                    // 최소화된 윈도우가 Dock에 아이콘으로 추가되면 Dock 폭이 바뀌고
+                    // 모든 아이콘의 x좌표가 밀린다. 갱신하지 않으면 다음 클릭이
+                    // 이웃 앱을 최소화한다.
+                    self.dockIndex.refreshAfterWindowChange()
                 }
                 self.log.debug("최소화 pid=\(pid) 윈도우=\(count)개")
+            }
+
+        case .restore(let pid):
+            work.async { [weak self] in
+                guard let self else { return }
+                let count = WindowController.restore(pid: pid)
+                if count > 0 {
+                    self.appState.markRestored(pid: pid)
+                    self.dockIndex.refreshAfterWindowChange()
+                }
+                self.log.debug("복원 pid=\(pid) 윈도우=\(count)개")
             }
         }
     }
@@ -2166,7 +2076,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 Run: `swift build && ./Scripts/install.sh`
 Expected: `완료.`
 
-- [ ] **Step 4: 실제 동작 확인 — 이 프로젝트의 첫 성공 지점**
+- [ ] **Step 4: 최소화 확인 — 이 프로젝트의 첫 성공 지점**
 
 1. 메모 앱을 열고 윈도우를 하나 띄운다
 2. 메모가 활성 상태인 것을 확인한다
@@ -2174,31 +2084,45 @@ Expected: `완료.`
 
 Expected: 메모 윈도우가 지니 효과로 최소화된다.
 
-- [ ] **Step 5: 복원 확인 — 이중 가드 검증**
+- [ ] **Step 5: 복원 확인 — Dock은 복원하지 않으므로 우리 코드가 하는 일이다**
 
 Dock의 메모 아이콘을 한 번 더 클릭한다.
 
-Expected: 최소화된 윈도우가 복원된다. **복원되지 않고 갇히면 이중 가드가 동작하지 않는 것이므로 Task 7과 Task 11로 돌아간다.**
+Expected: 최소화된 윈도우가 복원된다.
 
-- [ ] **Step 6: 비활성 앱 클릭 확인**
+복원되지 않으면 `.restore` 경로나 `markRestored`가 동작하지 않는 것이다. `log show`로 `복원 pid=... 윈도우=N개`가 찍히는지 확인한다. `윈도우=0개`면 `WindowController.targets`의 술어가 최소화된 윈도우를 놓치고 있는 것이다(subrole 필터를 다시 확인할 것).
+
+- [ ] **Step 6: 연속 토글 확인 — 정착 구간 검증**
+
+메모 아이콘을 **빠르게 4~6회 연속 클릭**한다.
+
+Expected: 최소화 → 복원 → 최소화 → 복원이 매번 번갈아 일어난다. 한쪽으로 멈추면 `AppStateCache`의 정착 구간이나 `markRestored`가 빠진 것이다.
+
+- [ ] **Step 7: 이웃 아이콘 오작동 확인 — Dock 재정렬 검증**
+
+시스템 설정 > 데스크탑 및 Dock 에서 **"윈도우를 앱 아이콘으로 최소화"가 꺼져 있는지**(기본값) 확인한다. 이 설정에서 최소화하면 Dock에 아이콘이 추가되어 전체가 밀린다.
+
+메모를 최소화한 **직후 곧바로** 옆에 있는 다른 앱의 아이콘을 클릭한다.
+
+Expected: 의도한 그 앱이 활성화된다. 엉뚱한 앱이 최소화되면 `refreshAfterWindowChange`가 동작하지 않는 것이다.
+
+- [ ] **Step 8: 비활성 앱 클릭 확인**
 
 메모가 활성인 상태에서 Dock의 **다른** 앱 아이콘을 클릭한다.
 
 Expected: 그 앱이 평소처럼 활성화된다. 최소화되지 않는다.
 
-- [ ] **Step 7: 로그 확인**
+- [ ] **Step 9: 로그 확인**
 
-Run: `log show --predicate 'subsystem == "com.changhun.dockminimizer"' --last 2m --info --debug`
-Expected: `최소화 pid=... 윈도우=1개` 형태의 로그. `콜백이 느립니다` 경고가 **없어야** 한다.
+Run: `log show --predicate 'subsystem == "com.changhun.dockminimizer"' --last 5m --info --debug`
+Expected: `최소화`/`복원` 로그가 보이고, `콜백이 느립니다` 경고가 **없어야** 한다.
 
-- [ ] **Step 8: 커밋**
+- [ ] **Step 10: 커밋**
 
 ```bash
 git add -A
-git commit -m "feat: Coordinator 배선 — 첫 동작 완성"
+git commit -m "feat: Coordinator 배선 — 최소화·복원 토글 완성"
 ```
-
----
 
 # Phase 3 — 설정과 편의 기능
 
@@ -2578,9 +2502,14 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
         enabledItem.state = settings.isEnabled ? .on : .off
         loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
-        permissionItem.title = permissions.isTrusted
-            ? "접근성 권한: 정상"
-            : "접근성 권한 없음 — 설정에서 허용 필요"
+        if DockIndex.isDockMagnificationEnabled {
+            // 확대 중에는 DockIndex가 빈 스냅샷을 내보내 기능이 멈춘다. 그 이유를 알린다.
+            permissionItem.title = "Dock 확대가 켜져 있어 일시 중지됨"
+        } else if permissions.isTrusted {
+            permissionItem.title = "접근성 권한: 정상"
+        } else {
+            permissionItem.title = "접근성 권한 없음 — 설정에서 허용 필요"
+        }
     }
 
     @objc private func toggleEnabled() {
@@ -2685,7 +2614,8 @@ git commit -m "feat: 권한 관리, 설정 창, 메뉴바 완성"
 - [ ] 최근 사용 항목 영역 클릭 — 개입하지 않는다
 - [ ] 스택/폴더 클릭 — 평소대로 열린다
 - [ ] 휴지통 클릭 — 평소대로 열린다
-- [ ] 최소화된 윈도우가 개별 아이콘으로 표시되는 설정에서의 동작
+- [ ] **"윈도우를 앱 아이콘으로 최소화" 끔 (기본값)** — 최소화가 Dock 폭을 바꿔 모든 아이콘이 밀린다. 최소화 직후 옆 아이콘을 클릭해 엉뚱한 앱이 최소화되지 않는지
+- [ ] **"윈도우를 앱 아이콘으로 최소화" 켬** — 위 문제가 사라지는 설정. 둘 다 확인해야 버그가 숨지 않는다
 
 ## 앱 상태
 - [ ] 풀스크린 앱 — 최소화되지 않고 기존 동작 유지
@@ -2694,6 +2624,8 @@ git commit -m "feat: 권한 관리, 설정 창, 메뉴바 완성"
 - [ ] 일부 윈도우만 이미 최소화된 앱 — 나머지만 최소화된다
 - [ ] Finder — 개입하지 않는다
 - [ ] 여러 윈도우를 가진 앱 — 전부 최소화된다
+- [ ] 빠른 연속 클릭 — 최소화/복원이 매번 번갈아 일어난다 (정착 구간)
+- [ ] 기능을 끄거나 앱을 제외 목록에 넣은 뒤에도, 전부 최소화된 앱을 Dock의 최소화 윈도우 항목으로 복구할 수 있다
 
 ## 입력 변형
 - [ ] 우클릭 — 컨텍스트 메뉴가 정상 표시된다
@@ -2794,10 +2726,16 @@ Dock AX 조회는 수십 밀리초가 걸리는 IPC이고, 콜백이 지연되�
 "한동안 잘 되다가 갑자기 멈추는" 증상이 나타난다. `DockIndex`와 `AppStateCache`가
 모든 AX 조회를 백그라운드에서 미리 수행해 불변 스냅샷으로 캐싱하는 이유다.
 
-두 번째로 중요한 것은 `ClickRouter`의 **이중 가드**다. 윈도우를 최소화해도 앱은
-프론트모스트로 남기 때문에, "프론트모스트면 최소화"라는 조건만으로는 모든 윈도우가
-최소화된 뒤의 클릭도 최소화로 판정되어 앱을 되살릴 수 없게 된다.
-`minimizedByUs` 집합과 "보이는 윈도우 ≥ 1" 판정이 이를 막는다.
+두 번째로 중요한 것은 **복원도 이 앱이 직접 한다**는 점이다. Dock은 프론트모스트 앱의
+윈도우가 전부 최소화된 상태에서 아이콘을 클릭해도 아무 일도 하지 않는다(Phase 0 실측).
+윈도우를 최소화해도 앱은 프론트모스트로 남으므로, Dock의 기본 복원에 기대면 사용자가
+앱을 되살릴 수 없게 된다. 그래서 `ClickRouter`는 프론트모스트 앱의 윈도우 상태에 따라
+최소화·복원·무시의 3분기로 판정한다.
+
+세 번째는 **최소화가 Dock 레이아웃을 바꾼다**는 점이다. 최소화된 윈도우가 Dock에 별도
+아이콘으로 추가되면 가운데 정렬이 다시 계산되어 모든 아이콘의 x좌표가 밀린다. 이 변화는
+어떤 시스템 알림으로도 통보되지 않으므로, 최소화·복원 직후 `DockIndex`를 직접 갱신한다.
+그러지 않으면 다음 클릭이 이웃 앱을 최소화한다.
 
 ## 알려진 제약
 
