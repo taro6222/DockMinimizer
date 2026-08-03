@@ -116,6 +116,17 @@ if mode == "dump" {
     }
 }
 
+if mode == "verify" {
+    let appName = CommandLine.arguments.dropFirst(2).first ?? "메모"
+    let bundleID = CommandLine.arguments.dropFirst(3).first ?? "com.apple.Notes"
+    exit(runVerification(appName: appName, bundleID: bundleID))
+}
+
+if mode == "race" {
+    let bundleID = CommandLine.arguments.dropFirst(2).first ?? "com.apple.Notes"
+    exit(runRaceCheck(bundleID: bundleID))
+}
+
 if mode == "experiment" {
     let appName = CommandLine.arguments.dropFirst(2).first ?? "메모"
     let bundleID = CommandLine.arguments.dropFirst(3).first ?? "com.apple.Notes"
