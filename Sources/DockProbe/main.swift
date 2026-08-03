@@ -84,30 +84,43 @@ print("Dock pid: \(dock.processIdentifier)")
 let dockApp = AXUIElementCreateApplication(dock.processIdentifier)
 AXUIElementSetMessagingTimeout(dockApp, 1.0)
 
-print("\n=== 트리 (깊이 3) ===")
-dumpTree(dockApp, depth: 0, maxDepth: 3)
+let mode = CommandLine.arguments.dropFirst().first ?? "dump"
 
-print("\n=== 발견된 AXList ===")
-var lists: [AXUIElement] = []
-collectLists(dockApp, into: &lists)
-print("AXList 개수: \(lists.count)")
+if mode == "dump" {
+    print("\n=== 트리 (깊이 3) ===")
+    dumpTree(dockApp, depth: 0, maxDepth: 3)
 
-for (index, list) in lists.enumerated() {
-    let items = children(list)
-    print("\n--- LIST[\(index)] frame=\(frame(list)) items=\(items.count)")
-    for item in items {
-        let title = describe(item, kAXTitleAttribute as String)
-        let subrole = describe(item, kAXSubroleAttribute as String)
-        let url = describe(item, "AXURL")
-        let running = describe(item, "AXIsApplicationRunning")
-        print("  title=\(title)")
-        print("    subrole=\(subrole) frame=\(frame(item))")
-        print("    AXURL=\(url) AXIsApplicationRunning=\(running)")
-        print("    attributes=\(attributeNames(item).joined(separator: ", "))")
+    print("\n=== 발견된 AXList ===")
+    var lists: [AXUIElement] = []
+    collectLists(dockApp, into: &lists)
+    print("AXList 개수: \(lists.count)")
+
+    for (index, list) in lists.enumerated() {
+        let items = children(list)
+        print("\n--- LIST[\(index)] frame=\(frame(list)) items=\(items.count)")
+        for item in items {
+            let title = describe(item, kAXTitleAttribute as String)
+            let subrole = describe(item, kAXSubroleAttribute as String)
+            let url = describe(item, "AXURL")
+            let running = describe(item, "AXIsApplicationRunning")
+            print("  title=\(title)")
+            print("    subrole=\(subrole) frame=\(frame(item))")
+            print("    AXURL=\(url) AXIsApplicationRunning=\(running)")
+            print("    attributes=\(attributeNames(item).joined(separator: ", "))")
+        }
+    }
+
+    print("\n=== 화면 ===")
+    for screen in NSScreen.screens {
+        print("frame=\(screen.frame) visibleFrame=\(screen.visibleFrame)")
     }
 }
 
-print("\n=== 화면 ===")
-for screen in NSScreen.screens {
-    print("frame=\(screen.frame) visibleFrame=\(screen.visibleFrame)")
+if mode == "experiment" {
+    let appName = CommandLine.arguments.dropFirst(2).first ?? "메모"
+    let bundleID = CommandLine.arguments.dropFirst(3).first ?? "com.apple.Notes"
+    experimentCoordinateSpace()
+    experimentMagnification()
+    experimentDockDefaultBehavior(appName: appName, bundleID: bundleID)
+    print("\n########## 실측 완료 ##########")
 }
