@@ -1781,7 +1781,9 @@ git commit -m "feat: AppStateCache와 WindowController — 윈도우 상태 캐�
 
 ## Task 13: EventTapController
 
-**Phase 0 실측 반영:** 우리가 개입하는 모든 상태에서 Dock의 기본 동작은 "아무 것도 하지 않음"이었다. 따라서 **클릭을 삼킬 필요가 없고 리슨 전용 탭으로 충분하다 (Plan A 확정).** 액티브 탭 분기와 mouseUp 삼킴 상태머신은 넣지 않는다 — 쓰이지 않을 코드를 테스트 없이 남기는 것보다 없는 편이 낫다. 필요해지면 findings 문서의 측정 절차를 다시 돌려 판단한다.
+**실측 반영 (Plan B):** Phase 0의 1차 측정은 "Dock이 혼자서 무엇을 바꾸는가"만 보았고 리슨 전용 탭으로 충분하다고 결론냈지만, **틀렸다.** 격리 실험 결과 Dock 클릭과 같은 시점에 최소화하면 Dock이 100ms 안에 원상복구한다. `.success`가 반환되고 로그도 정상이라 증상은 "아무 일도 일어나지 않음"으로만 보인다.
+
+따라서 **액티브 탭(`.defaultTap`)으로 개입하는 클릭을 삼킨다.** mouseDown을 삼켰다면 짝이 되는 mouseUp도 반드시 삼켜야 Dock이 이상 상태에 빠지지 않는다. `.ignore`면 통과시켜 기존 Dock 동작을 그대로 둔다.
 
 **Files:**
 - Create: `Sources/DockMinimizer/EventTapController.swift`

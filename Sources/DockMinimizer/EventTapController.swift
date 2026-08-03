@@ -20,6 +20,9 @@ final class EventTapController: @unchecked Sendable {
     private let perform: Performer
     private let log = Logger(subsystem: "com.changhun.dockminimizer", category: "eventtap")
 
+    /// mouseDown을 삼켰는지. 탭 스레드에서만 접근한다.
+    private var swallowNextMouseUp = false
+
     private var tap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private var thread: Thread?
@@ -59,7 +62,10 @@ final class EventTapController: @unchecked Sendable {
     }
 
     private func installTap() -> Bool {
-        let mask = CGEventMask(1 << CGEventType.leftMouseDown.rawValue)
+        let mask = CGEventMask(
+            (1 << CGEventType.leftMouseDown.rawValue) |
+            (1 << CGEventType.leftMouseUp.rawValue)
+        )
 
         let callback: CGEventTapCallBack = { _, type, event, refcon in
             guard let refcon else { return Unmanaged.passUnretained(event) }
@@ -67,11 +73,16 @@ final class EventTapController: @unchecked Sendable {
             return controller.handle(type: type, event: event)
         }
 
-        // 리슨 전용. 클릭을 삼키지 않으므로 Dock 상호작용을 절대 깨뜨리지 않는다.
+        // 액티브 탭. 우리가 개입하는 클릭은 삼켜야 한다.
+        //
+        // 리슨 전용으로는 동작하지 않는다. 클릭이 Dock에도 전달되면, 우리가 최소화한
+        // 직후 Dock이 같은 클릭을 처리하면서 윈도우를 원상복구한다(100ms 이내로 측정됨).
+        // Phase 0에서 "Dock은 아무 것도 하지 않는다"고 본 것은 되돌릴 대상이 없을 때의
+        // 관찰이었고, 우리 동작과 겹칠 때의 반응은 그것과 다르다.
         guard let tap = CGEvent.tapCreate(
             tap: .cgSessionEventTap,
             place: .headInsertEventTap,
-            options: .listenOnly,
+            options: .defaultTap,
             eventsOfInterest: mask,
             callback: callback,
             userInfo: Unmanaged.passUnretained(self).toOpaque()
@@ -86,7 +97,7 @@ final class EventTapController: @unchecked Sendable {
 
         self.tap = tap
         self.runLoopSource = source
-        log.info("이벤트 탭 시작 (listenOnly)")
+        log.info("이벤트 탭 시작 (defaultTap — 개입한 클릭은 삼킨다)")
         return true
     }
 
@@ -101,6 +112,14 @@ final class EventTapController: @unchecked Sendable {
             if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
             return Unmanaged.passUnretained(event)
         }
+        // mouseDown을 삼켰다면 짝이 되는 mouseUp도 삼켜야 Dock이 이상 상태에 빠지지 않는다.
+        if type == .leftMouseUp {
+            if swallowNextMouseUp {
+                swallowNextMouseUp = false
+                return nil
+            }
+            return Unmanaged.passUnretained(event)
+        }
         guard type == .leftMouseDown else { return Unmanaged.passUnretained(event) }
 
         let started = DispatchTime.now().uptimeNanoseconds
@@ -113,11 +132,12 @@ final class EventTapController: @unchecked Sendable {
         }
 
         let decision = decide(event.location, Self.modifiers(from: event.flags))
-        if decision != .ignore {
-            perform(decision)
-        }
-        // 리슨 전용이므로 항상 이벤트를 그대로 통과시킨다.
-        return Unmanaged.passUnretained(event)
+        guard decision != .ignore else { return Unmanaged.passUnretained(event) }
+
+        perform(decision)
+        // 삼키지 않으면 Dock이 같은 클릭을 처리하며 우리 동작을 원상복구한다.
+        swallowNextMouseUp = true
+        return nil
     }
 
     private static func modifiers(from flags: CGEventFlags) -> ClickModifiers {

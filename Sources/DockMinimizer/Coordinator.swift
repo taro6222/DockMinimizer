@@ -39,14 +39,14 @@ final class Coordinator: @unchecked Sendable {
         let controller = EventTapController(
             decide: { [weak self] point, modifiers in
                 guard let self else { return .ignore }
-                let snapshot = self.cachedSettings.withLock { $0 }
+                let settings = self.cachedSettings.withLock { $0 }
                 return ClickRouter.decide(RouterInput(
                     point: point,
                     modifiers: modifiers,
                     snapshot: self.dockIndex.snapshot,
                     frontmost: self.appState.frontmost,
-                    isEnabled: snapshot.isEnabled,
-                    excludedBundleIDs: snapshot.excluded
+                    isEnabled: settings.isEnabled,
+                    excludedBundleIDs: settings.excluded
                 ))
             },
             perform: { [weak self] decision in
@@ -86,7 +86,7 @@ final class Coordinator: @unchecked Sendable {
                     // 이웃 앱을 최소화한다.
                     self.dockIndex.refreshAfterWindowChange()
                 }
-                self.log.debug("최소화 pid=\(pid) 윈도우=\(count)개")
+                self.log.info("최소화 pid=\(pid) 윈도우=\(count)개")
             }
 
         case .restore(let pid):
@@ -97,7 +97,7 @@ final class Coordinator: @unchecked Sendable {
                     self.appState.markRestored(pid: pid)
                     self.dockIndex.refreshAfterWindowChange()
                 }
-                self.log.debug("복원 pid=\(pid) 윈도우=\(count)개")
+                self.log.info("복원 pid=\(pid) 윈도우=\(count)개")
             }
         }
     }

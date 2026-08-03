@@ -151,11 +151,20 @@ Hide(`NSRunningApplication.hide()`)와 달리 `kAXMinimized = true`는 앱을 �
 
 **대응:** 최소화/복원을 수행한 직후와 지니 애니메이션이 끝난 뒤(약 700ms) 각각 `DockIndex.refresh()`를 호출한다.
 
-## 7. 클릭 삼킴 불필요 — Plan A 확정 (Phase 0 실측)
+## 7. 클릭 삼킴 필요 — Plan B (구현 검증으로 확정)
 
-우리가 개입하는 세 상태(프론트모스트 + 보임 / 전부 최소화 / 일부 최소화) 모두에서 Dock의 기본 동작은 **아무 것도 하지 않는 것**으로 측정되었다.
+Phase 0의 1차 측정에서는 우리가 개입하는 세 상태 모두에서 Dock의 기본 동작이 "아무 것도 하지 않음"으로 나왔고, 그래서 리슨 전용 탭(Plan A)으로 충분하다고 판단했다.
 
-따라서 클릭을 삼킬 필요가 없고 `kCGEventTapOptionListenOnly` 패시브 탭으로 충분하다. 액티브 탭의 삼킴 상태머신이 불필요하고, Dock 상호작용을 깨뜨릴 위험도 없으며, 타임아웃으로 탭이 죽을 위험도 낮다.
+**그 판단은 틀렸다.** 그 측정은 "Dock이 혼자서 무엇을 바꾸는가"만 보았고 "우리가 바꾼 것을 Dock이 되돌리는가"는 보지 않았다. 격리 실험 결과, 클릭 없이 최소화하면 상태가 유지되지만 Dock 클릭과 같은 시점에 최소화하면 **100ms 안에 원상복구된다.**
+
+`AXUIElementSetAttributeValue`가 `.success`를 반환하고 로그도 정상이라 증상은 그저 "아무 일도 일어나지 않음"으로 보인다. 원인이 전혀 드러나지 않는 종류의 버그다.
+
+**결론: `kCGEventTapOptionDefault` 액티브 탭으로 개입하는 클릭을 삼킨다.**
+
+- `.ignore`가 아닌 판정이 나오면 mouseDown을 삼키고(`return nil`), 짝이 되는 mouseUp도 삼킨다. mouseDown만 삼키면 Dock이 이상 상태에 빠진다
+- `.ignore`면 그대로 통과시킨다. 프론트모스트가 아닌 앱 클릭, 우클릭, 제외 앱, Dock 바깥 클릭은 전부 평소대로 동작한다 (검증 통과)
+
+액티브 탭은 타임아웃으로 죽을 위험이 있으므로 §5의 제약이 더욱 중요해진다. 콜백은 캐시 읽기와 기하 비교만 수행하고, `kCGEventTapDisabledByTimeout`을 잡아 재활성화한다.
 
 ## 8. Phase 0 스파이크 (게이트)
 
@@ -187,7 +196,7 @@ TCC 권한은 코드 서명과 번들 ID에 묶인다. 서명이 바뀌면 권�
 
 - `ClickRouter` 단위 테스트 작성 후 구현 (3분기 판정)
 - `DockIndex` 캐시와 갱신 트리거 (동작 직후 갱신 포함)
-- `EventTapController` (리슨 전용) 및 비활성화 복구
+- `EventTapController` (액티브 탭, 클릭 삼킴) 및 비활성화 복구
 - `AppStateCache` — 윈도우 상태와 정착 구간
 - `WindowController` — 최소화와 복원
 
