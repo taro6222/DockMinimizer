@@ -18,6 +18,9 @@ final class Coordinator: @unchecked Sendable {
     private var tapController: EventTapController?
     private var isRunning = false
 
+    /// 권한이 있어도 탭이 살아 있지 않을 수 있다. 메뉴바가 그 차이를 사용자에게 알린다.
+    var isTapActive: Bool { tapController?.isActive ?? false }
+
     init(settings: Settings) {
         self.settings = settings
     }

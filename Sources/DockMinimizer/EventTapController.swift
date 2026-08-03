@@ -28,6 +28,12 @@ final class EventTapController: @unchecked Sendable {
     private var swallowedDownAt: UInt64?
     private static let swallowWindow: UInt64 = 1_000_000_000  // 1초
 
+    /// 탭이 실제로 생성되어 살아 있는가.
+    /// 권한이 부여되어도 프로세스가 권한 획득 이전에 시작되었다면 tapCreate가 실패한다.
+    private let active = OSAllocatedUnfairLock(initialState: false)
+
+    var isActive: Bool { active.withLock { $0 } }
+
     private var tap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private var thread: Thread?
@@ -64,6 +70,7 @@ final class EventTapController: @unchecked Sendable {
         runLoopSource = nil
         thread = nil
         threadRunLoop = nil
+        active.withLock { $0 = false }
     }
 
     private func installTap() -> Bool {
@@ -93,6 +100,7 @@ final class EventTapController: @unchecked Sendable {
             userInfo: Unmanaged.passUnretained(self).toOpaque()
         ) else {
             log.error("이벤트 탭 생성 실패. 접근성 권한을 확인하세요.")
+            active.withLock { $0 = false }
             return false
         }
 
@@ -102,6 +110,7 @@ final class EventTapController: @unchecked Sendable {
 
         self.tap = tap
         self.runLoopSource = source
+        active.withLock { $0 = true }
         log.info("이벤트 탭 시작 (defaultTap — 개입한 클릭은 삼킨다)")
         return true
     }

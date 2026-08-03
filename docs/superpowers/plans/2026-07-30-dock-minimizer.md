@@ -2171,9 +2171,11 @@ git commit -m "feat: Coordinator 배선 — 최소화·복원 토글 완성"
 
 - [ ] **Step 1: `Sources/DockMinimizer/PermissionsManager.swift` 작성**
 
+`ApplicationServices`는 `@preconcurrency`로 가져와야 한다. `kAXTrustedCheckOptionPrompt`가 `Unmanaged<CFString>` 전역 변수로 임포트되어 Swift 6 strict concurrency가 `not concurrency-safe because it involves shared mutable state`를 낸다. 참조 지점에서 발생하므로 `nonisolated(unsafe)`로는 억제되지 않는다.
+
 ```swift
 import AppKit
-import ApplicationServices
+@preconcurrency import ApplicationServices
 import Combine
 
 /// 접근성 권한의 현재 상태를 관찰 가능한 형태로 노출한다.
@@ -2225,6 +2227,49 @@ final class PermissionsManager: ObservableObject {
 - [ ] **Step 2: `AppDelegate`에 배선**
 
 `Sources/DockMinimizer/AppDelegate.swift`를 다음으로 교체한다.
+
+### 먼저: 탭 생존 여부를 노출한다
+
+실측에서 **권한을 부여해도 실행 중이던 프로세스의 TCC `auth_value`는 `1`(unknown)로 남았고, 재시작 후에야 `2`(allowed)가 되었다.** 즉 "권한이 켜지면 재실행 없이 동작한다"를 전제로 만들면 안 된다. 어느 쪽이든 옳게 동작하도록, 권한 상태와 **탭이 실제로 살아 있는지**를 따로 노출한다.
+
+`Sources/DockMinimizer/EventTapController.swift`에 다음을 추가한다. `active` 프로퍼티 선언은 `swallowedDownAt` 선언 옆에 둔다.
+
+```swift
+    /// 탭이 실제로 생성되어 살아 있는가.
+    /// 권한이 부여되어도 프로세스가 권한 획득 이전에 시작되었다면 tapCreate가 실패한다.
+    private let active = OSAllocatedUnfairLock(initialState: false)
+
+    var isActive: Bool { active.withLock { $0 } }
+```
+
+`installTap()`의 실패 분기와 성공 지점에 각각 반영한다.
+
+```swift
+        } else {
+            log.error("이벤트 탭 생성 실패. 접근성 권한을 확인하세요.")
+            active.withLock { $0 = false }
+            return false
+        }
+```
+
+```swift
+        active.withLock { $0 = true }
+        log.info("이벤트 탭 시작 (defaultTap — 개입한 클릭은 삼킨다)")
+        return true
+```
+
+`stop()`에도 추가한다.
+
+```swift
+        active.withLock { $0 = false }
+```
+
+`Sources/DockMinimizer/Coordinator.swift`에 노출한다.
+
+```swift
+    /// 권한이 있어도 탭이 살아 있지 않을 수 있다. 메뉴바가 그 차이를 사용자에게 알린다.
+    var isTapActive: Bool { tapController?.isActive ?? false }
+```
 
 권한은 앱 실행 후에 부여되는 것이 정상 경로다. README의 설치 순서 자체가 "설치 → 실행 → 시스템 설정에서 허용"이므로, `isTrusted`가 false→true로 바뀌는 순간 Coordinator를 시작해야 한다. 이 구독이 없으면 앱이 켜져 있는데 아무 일도 하지 않고, 재실행해야만 동작하게 된다. 반대 방향(권한 회수)도 구독해야 죽은 탭을 붙들고 있지 않는다.
 
@@ -2278,6 +2323,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 `Coordinator.start()`와 `stop()`은 `isRunning` 가드가 있으므로 중복 호출이 안전하다. `@Published`는 구독 즉시 현재 값을 내보내므로, 이미 권한이 있는 상태로 실행되면 곧바로 `start()`가 호출된다.
 
+`AXIsProcessTrusted()`가 실행 중인 프로세스에서 false→true로 바뀌지 않는다면 이 구독은 발화하지 않는다. 그 경우를 위해 Task 17이 `isTapActive`를 보고 재실행을 안내한다. 둘 중 어느 쪽이 실제 동작인지는 Phase 4에서 확인한다.
+
 `MenuBarController`의 시그니처가 바뀌었으므로 Task 16까지는 빌드가 실패한다. 두 작업을 연속으로 진행한다.
 
 - [ ] **Step 3: 커밋 (Task 16 완료 후)**
@@ -2297,6 +2344,9 @@ import DockMinimizerCore
 import SwiftUI
 
 /// 설정 창의 상태를 SwiftUI에 노출하는 어댑터.
+`Settings`는 반드시 `DockMinimizerCore.Settings`로 한정한다. 이 파일은 SwiftUI도 임포트하는데 SwiftUI에 `Settings: Scene`이 있어 `'Settings' is ambiguous for type lookup in this context`가 난다.
+
+```swift
 @MainActor
 final class SettingsModel: ObservableObject {
     @Published var isEnabled: Bool {
@@ -2309,12 +2359,16 @@ final class SettingsModel: ObservableObject {
     }
     @Published private(set) var exclusions: [String]
 
-    let settings: Settings
+    let settings: DockMinimizerCore.Settings
     let permissions: PermissionsManager
     private let coordinator: Coordinator
     private var isSyncing = false
 
-    init(settings: Settings, permissions: PermissionsManager, coordinator: Coordinator) {
+    init(
+        settings: DockMinimizerCore.Settings,
+        permissions: PermissionsManager,
+        coordinator: Coordinator
+    ) {
         self.settings = settings
         self.permissions = permissions
         self.coordinator = coordinator
@@ -2481,6 +2535,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     private let enabledItem = NSMenuItem(title: "활성화", action: nil, keyEquivalent: "")
     private let loginItem = NSMenuItem(title: "로그인 시 시작", action: nil, keyEquivalent: "")
     private let permissionItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+    private let relaunchItem = NSMenuItem(title: "재실행", action: nil, keyEquivalent: "")
 
     init(settings: Settings, permissions: PermissionsManager, coordinator: Coordinator) {
         self.settings = settings
@@ -2516,6 +2571,10 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         loginItem.action = #selector(toggleLoginItem)
         menu.addItem(loginItem)
 
+        relaunchItem.target = self
+        relaunchItem.action = #selector(relaunch)
+        menu.addItem(relaunchItem)
+
         menu.addItem(.separator())
 
         let settingsItem = NSMenuItem(
@@ -2542,11 +2601,16 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         if DockIndex.isDockMagnificationEnabled {
             // 확대 중에는 DockIndex가 빈 스냅샷을 내보내 기능이 멈춘다. 그 이유를 알린다.
             permissionItem.title = "Dock 확대가 켜져 있어 일시 중지됨"
-        } else if permissions.isTrusted {
-            permissionItem.title = "접근성 권한: 정상"
-        } else {
+        } else if !permissions.isTrusted {
             permissionItem.title = "접근성 권한 없음 — 설정에서 허용 필요"
+        } else if !coordinator.isTapActive {
+            // 권한은 있는데 탭이 없다. TCC 권한은 프로세스 시작 시점에 고정될 수 있어,
+            // 실행 중에 권한을 부여하면 재실행해야 반영된다 (실측 확인).
+            permissionItem.title = "권한 부여됨 — 재실행해야 적용됩니다"
+        } else {
+            permissionItem.title = "접근성 권한: 정상"
         }
+        relaunchItem.isHidden = permissions.isTrusted && coordinator.isTapActive
     }
 
     @objc private func toggleEnabled() {
@@ -2571,6 +2635,17 @@ final class MenuBarController: NSObject, NSMenuDelegate {
 
     @objc private func openSettings() {
         settingsWindow.show()
+    }
+
+    /// 실행 중에 부여된 접근성 권한을 적용하려면 프로세스를 다시 띄워야 한다.
+    @objc private func relaunch() {
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.createsNewApplicationInstance = true
+        NSWorkspace.shared.openApplication(
+            at: Bundle.main.bundleURL, configuration: configuration
+        ) { _, _ in
+            DispatchQueue.main.async { NSApp.terminate(nil) }
+        }
     }
 }
 ```
@@ -2604,7 +2679,12 @@ Expected: 설정 창의 체크박스가 메뉴바에서 바꾼 값과 일치한�
 
 시스템 설정 > 손쉬운 사용에서 DockMinimizer 권한을 **끈다**. Dock 클릭 최소화가 멈추는지 확인한다. 다시 **켠다**.
 
-Expected: **앱을 재실행하지 않고도** Dock 클릭 최소화가 다시 동작한다. 재실행해야만 동작한다면 `AppDelegate`의 `permissionSubscription`이 연결되지 않은 것이다.
+Expected(둘 중 하나이며, 어느 쪽이든 통과다):
+
+- 재실행 없이 동작이 재개된다 → `permissionSubscription`이 제대로 발화했다
+- 동작하지 않지만 메뉴바에 `권한 부여됨 — 재실행해야 적용됩니다`가 표시되고 `재실행` 항목이 보인다 → TCC가 프로세스 시작 시점에 권한을 고정한 경우이며, 앱이 그 사실을 사용자에게 알리고 있으므로 정상이다
+
+둘 다 아니면(아무 안내 없이 조용히 멈춰 있으면) 실패다. 어느 쪽이 실제 동작이었는지 `docs/superpowers/specs/2026-07-30-phase0-findings.md`에 기록한다.
 
 - [ ] **Step 7: 로그인 시 시작 확인**
 
