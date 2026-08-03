@@ -549,12 +549,16 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
     -addext "keyUsage=critical,digitalSignature" \
     -addext "extendedKeyUsage=critical,codeSigning"
 
+# 빈 암호로 내보내면 macOS security가 MAC 검증에 실패한다
+# ("SecKeychainItemImport: MAC verification failed during PKCS12 import").
+# LibreSSL 3.3.6에서 실제로 재현됨. 임시 암호를 쓰면 통과한다.
+P12_PASS="dockminimizer-import"
 openssl pkcs12 -export -out "$WORK/identity.p12" \
     -inkey "$WORK/key.pem" -in "$WORK/cert.pem" \
-    -name "$CERT_NAME" -passout pass:
+    -name "$CERT_NAME" -passout "pass:$P12_PASS"
 
 echo "==> 키체인에 가져오기 (키체인 암호 입력창이 뜰 수 있습니다)"
-security import "$WORK/identity.p12" -k "$KEYCHAIN" -P "" \
+security import "$WORK/identity.p12" -k "$KEYCHAIN" -P "$P12_PASS" \
     -T /usr/bin/codesign -T /usr/bin/security
 
 echo "==> 코드서명 신뢰 설정 (암호 입력창이 뜰 수 있습니다)"
