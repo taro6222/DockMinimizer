@@ -16,12 +16,37 @@
 
 ## 설치
 
+### 설치 파일(DMG) 만들기
+
 ```bash
 ./Scripts/make-cert.sh   # 최초 1회. 고정 코드서명 인증서를 만든다
+./Scripts/make-dmg.sh    # build/DockMinimizer-<버전>.dmg 생성
+```
+
+DMG를 열고 `DockMinimizer.app`을 `Applications`로 끌어다 놓는다. 설치 안내는 DMG 안의
+`먼저 읽어주세요.txt`에도 들어 있다.
+
+### 개발 중 재설치
+
+```bash
 ./Scripts/install.sh     # 빌드 → /Applications 설치 → 실행
 ```
 
-설치 후 **시스템 설정 > 개인정보 보호 및 보안 > 손쉬운 사용**에서
+### 처음 실행 — Gatekeeper
+
+이 앱은 자체 서명이라 **다른 Mac에서는** 더블클릭으로 열리지 않는다.
+`DockMinimizer.app`을 우클릭 → `열기` → 다시 `열기`를 한 번만 하면 이후에는 그냥 열린다.
+그래도 안 되면:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/DockMinimizer.app
+```
+
+빌드한 본인의 Mac에서는 인증서가 키체인에 있으므로 이 과정이 필요 없다.
+
+### 접근성 권한 (필수)
+
+**시스템 설정 > 개인정보 보호 및 보안 > 손쉬운 사용**에서
 `/Applications/DockMinimizer.app`을 추가하고 켠다. 이 권한이 없으면 동작하지 않는다.
 
 권한을 켠 뒤에도 동작하지 않으면 메뉴바에 `권한 부여됨 — 재실행해야 적용됩니다`가
@@ -30,6 +55,11 @@
 
 `make-cert.sh`로 만든 고정 인증서를 쓰기 때문에 재빌드해도 권한이 유지된다.
 ad-hoc 서명(`codesign -s -`)을 쓰면 빌드마다 서명이 바뀌어 권한이 사라진다.
+
+### 제거
+
+메뉴바에서 종료 → `/Applications/DockMinimizer.app` 삭제 →
+손쉬운 사용 목록에서도 제거.
 
 ## 사용
 
@@ -90,6 +120,10 @@ Dock은 프론트모스트 앱의 윈도우가 전부 최소화된 상태에서 
 ## 알려진 제약
 
 - **App Store 배포 불가.** 샌드박스가 이벤트 탭 생성을 금지한다
+- **자체 서명이라 배포 시 Gatekeeper 경고가 뜬다.** 우클릭 → 열기로 우회한다.
+  경고 없이 배포하려면 Apple Developer Program($99/년)의 Developer ID 인증서로
+  서명하고 `notarytool`로 공증해야 한다. `Scripts/bundle.sh`의 `DOCKMINIMIZER_CERT`
+  환경 변수로 인증서를 바꿀 수 있다
 - **접근성 권한 필수**
 - **프론트모스트 앱 아이콘은 드래그 재배열 불가** (위 2번)
 - **Dock 확대가 켜져 있으면 기능이 일시 중지된다.** AX 프레임이 확대를 반영하지 않아
