@@ -1,5 +1,9 @@
 # DockMinimizer
 
+[![Release](https://img.shields.io/github/v/release/taro6222/DockMinimizer?label=release)](https://github.com/taro6222/DockMinimizer/releases/latest)
+[![License](https://img.shields.io/badge/license-GPL--3.0--or--later-blue)](LICENSE)
+[![macOS](https://img.shields.io/badge/macOS-14%2B-black)](https://github.com/taro6222/DockMinimizer/releases/latest)
+
 활성 상태인 앱의 Dock 아이콘을 클릭하면 그 앱의 윈도우를 최소화하는 macOS 메뉴바 앱.
 한 번 더 클릭하면 복원된다.
 
@@ -9,57 +13,61 @@
 다른 앱의 아이콘 클릭                     → 평소대로 활성화 (개입하지 않음)
 ```
 
-## 요구 사항
-
-- macOS 14 이상 (macOS 26.5에서 개발·검증)
-- Swift 6 툴체인 (Xcode 또는 Command Line Tools)
+macOS 기본 동작에서 이 클릭은 아무 일도 하지 않는다. 그 빈 동작을 최소화 토글로 쓴다.
 
 ## 설치
 
-### 설치 파일(DMG) 만들기
+**[최신 릴리스에서 DMG 내려받기](https://github.com/taro6222/DockMinimizer/releases/latest)**
 
-```bash
-./Scripts/make-cert.sh   # 최초 1회. 고정 코드서명 인증서를 만든다
-./Scripts/make-dmg.sh    # build/DockMinimizer-<버전>.dmg 생성
+DMG를 열고 `DockMinimizer.app`을 `Applications` 폴더로 끌어다 놓는다.
+아래 두 단계를 건너뛰면 동작하지 않으니 반드시 확인할 것.
+
+### 1. 첫 실행 — 우클릭 후 열기
+
+이 앱은 자체 서명이라 그냥 더블클릭하면 macOS가 실행을 막는다.
+
+```
+DockMinimizer.app 우클릭 → "열기" → 다시 "열기"
 ```
 
-DMG를 열고 `DockMinimizer.app`을 `Applications`로 끌어다 놓는다. 설치 안내는 DMG 안의
-`먼저 읽어주세요.txt`에도 들어 있다.
-
-### 개발 중 재설치
-
-```bash
-./Scripts/install.sh     # 빌드 → /Applications 설치 → 실행
-```
-
-### 처음 실행 — Gatekeeper
-
-이 앱은 자체 서명이라 **다른 Mac에서는** 더블클릭으로 열리지 않는다.
-`DockMinimizer.app`을 우클릭 → `열기` → 다시 `열기`를 한 번만 하면 이후에는 그냥 열린다.
-그래도 안 되면:
+한 번만 이렇게 하면 이후에는 그냥 열린다. 그래도 안 되면:
 
 ```bash
 xattr -dr com.apple.quarantine /Applications/DockMinimizer.app
 ```
 
-빌드한 본인의 Mac에서는 인증서가 키체인에 있으므로 이 과정이 필요 없다.
+### 2. 접근성 권한 — 필수
 
-### 접근성 권한 (필수)
+**시스템 설정 › 개인정보 보호 및 보안 › 손쉬운 사용**에서 `+` 버튼으로
+`/Applications/DockMinimizer.app`을 추가하고 켠다.
 
-**시스템 설정 > 개인정보 보호 및 보안 > 손쉬운 사용**에서
-`/Applications/DockMinimizer.app`을 추가하고 켠다. 이 권한이 없으면 동작하지 않는다.
+이 권한이 없으면 설치는 되지만 아무 동작도 하지 않는다. Dock 클릭을 감지하고
+다른 앱의 윈도우를 최소화하는 데 필요하다.
 
 권한을 켠 뒤에도 동작하지 않으면 메뉴바에 `권한 부여됨 — 재실행해야 적용됩니다`가
 표시된다. `재실행`을 누르면 된다. TCC 권한이 프로세스 시작 시점에 고정되기 때문이며,
 실측에서 재현되는 동작이다.
 
-`make-cert.sh`로 만든 고정 인증서를 쓰기 때문에 재빌드해도 권한이 유지된다.
-ad-hoc 서명(`codesign -s -`)을 쓰면 빌드마다 서명이 바뀌어 권한이 사라진다.
-
 ### 제거
 
-메뉴바에서 종료 → `/Applications/DockMinimizer.app` 삭제 →
-손쉬운 사용 목록에서도 제거.
+메뉴바에서 종료 → `/Applications/DockMinimizer.app` 삭제 → 손쉬운 사용 목록에서도 제거.
+
+## 소스에서 빌드
+
+macOS 14 이상, Swift 6 툴체인(Xcode 또는 Command Line Tools)이 필요하다.
+
+```bash
+git clone https://github.com/taro6222/DockMinimizer.git
+cd DockMinimizer
+./Scripts/make-cert.sh   # 최초 1회. 고정 코드서명 인증서를 만든다
+./Scripts/install.sh     # 빌드 → /Applications 설치 → 실행
+```
+
+배포용 DMG를 만들려면 `./Scripts/make-dmg.sh`.
+
+`make-cert.sh`로 만든 고정 인증서를 쓰기 때문에 재빌드해도 접근성 권한이 유지된다.
+ad-hoc 서명(`codesign -s -`)을 쓰면 빌드마다 서명이 바뀌어 권한이 사라진다.
+직접 빌드한 Mac에서는 인증서가 키체인에 있으므로 위 1번(우클릭 후 열기)이 필요 없다.
 
 ## 사용
 
@@ -75,6 +83,16 @@ swift run DockProbe        # Dock AX 트리 덤프
 swift run DockProbe watch  # 클릭과 아이콘 매칭 실시간 관찰
 swift run DockProbe experiment "메모" com.apple.Notes   # 좌표계·확대·Dock 동작 자동 실측
 ```
+
+설치된 앱의 실동작 검증:
+
+```bash
+swift run DockProbe verify   # 11개 항목 (토글, 연속 클릭, 수정자 키, Dock 재정렬)
+swift run DockProbe race     # 리슨 전용 탭 회귀 테스트 — 앱을 끄고 실행할 것
+```
+
+Dock이나 이벤트 탭 관련 코드를 고쳤다면 두 가지 모두 다시 돌릴 것. `race`는 아래
+구조 절의 2번이 여전히 유효한지 확인한다.
 
 로그 확인:
 
@@ -146,7 +164,12 @@ Dock은 프론트모스트 앱의 윈도우가 전부 최소화된 상태에서 
 
 | 문서 | 내용 |
 |---|---|
-| `docs/superpowers/specs/2026-07-30-dock-click-minimize-design.md` | 설계 |
-| `docs/superpowers/specs/2026-07-30-phase0-findings.md` | 플랫폼 동작 실측 결과 |
-| `docs/superpowers/specs/2026-07-30-verification.md` | 검증 기록과 남은 항목 |
-| `docs/superpowers/plans/2026-07-30-dock-minimizer.md` | 구현 계획 |
+| [설계](docs/superpowers/specs/2026-07-30-dock-click-minimize-design.md) | 아키텍처와 판정 로직, 대안과 폐기 사유 |
+| [실측 결과](docs/superpowers/specs/2026-07-30-phase0-findings.md) | macOS Dock의 실제 동작 측정. 위 구조 절의 근거 |
+| [검증 기록](docs/superpowers/specs/2026-07-30-verification.md) | 통과 항목, 남은 항목, 미해결 이슈 |
+| [구현 계획](docs/superpowers/plans/2026-07-30-dock-minimizer.md) | 단계별 작업 계획 |
+
+플랫폼 동작을 추측하지 않고 전부 합성 클릭으로 측정한 뒤 구현했다. 그 과정에서 Dock이
+프론트모스트 앱을 복원하지 않는다는 것, 최소화가 Dock 폭을 바꿔 모든 아이콘을 22.5pt
+밀어낸다는 것, 리슨 전용 탭으로는 Dock이 우리 최소화를 되돌린다는 것을 찾았다.
+셋 다 문서에 측정값과 함께 기록되어 있다.
