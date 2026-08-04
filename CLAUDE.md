@@ -23,13 +23,14 @@ swift test --filter <함수명>             # 단일 테스트. 예: --filter mi
 
 swift run DockProbe                     # Dock AX 트리 덤프
 swift run DockProbe verify              # 설치된 앱 동작 검증 11개
+swift run DockProbe ui                  # 메뉴바·설정 창·로그인 항목 15개
 swift run DockProbe race                # 리슨 전용 탭 회귀 테스트 (앱을 끄고 실행)
 swift run DockProbe experiment          # 좌표계·확대·Dock 기본 동작 실측
 
 log show --predicate 'subsystem == "com.changhun.dockminimizer"' --last 10m --info --debug
 ```
 
-`verify`와 `race`는 실제로 설치된 `/Applications/DockMinimizer.app`을 대상으로 동작하며 접근성 권한이 필요하다.
+`verify`·`ui`·`race`는 실제로 설치된 `/Applications/DockMinimizer.app`을 대상으로 동작하며 접근성 권한이 필요하다.
 `swift test`는 순수 로직만 다루므로 권한 없이 돌아간다.
 
 ## 아키텍처
@@ -97,11 +98,14 @@ Dock이나 이벤트 탭 관련 코드를 고쳤다면 `verify`와 `race`를 **�
 **합성 클릭은 반드시 `.cghidEventTap`으로 post한다.** `.cgSessionEventTap`으로 보낸 클릭은 Dock에
 전달되지 않아 모든 관찰이 "아무 일도 일어나지 않음"으로 나오고 잘못된 결론에 이른다.
 
-메뉴바·설정 창 같은 UI도 접근성 API로 검증할 수 있다. `LSUIElement` 앱이라 `AXMenuBar`는 nil이고
-상태 항목은 `AXExtrasMenuBar` 아래에 있으며, 메뉴 항목에 `AXPress`를 보내고
-`AXMenuItemMarkChar`로 체크 상태를 읽는다. 다만 **그 도구는 저장소에 없다** — 필요하면 다시
-만들어야 한다 (`DockProbe`의 `verify`/`race`와 달리 이관하지 않았다). `NSOpenPanel`은 모달이라
-자동화하면 세션이 막히므로 건드리지 않는다.
+`MenuBarController.swift`나 `SettingsWindow.swift`를 고쳤다면 `ui`를 돌린다. 메뉴바 ↔ 설정 창
+동기화처럼 창을 닫았다 다시 열어야 드러나는 것은 수동으로 놓치기 쉽다.
+
+UI 검증의 요령: `LSUIElement` 앱이라 `AXMenuBar`는 nil이고 상태 항목은 `AXExtrasMenuBar` 아래에
+있다. 메뉴를 열지 않아도 하위 항목을 읽고 `AXPress`를 보낼 수 있으며, 체크 상태는
+`AXMenuItemMarkChar`로 읽는다. 문구가 담기는 속성은 요소마다 달라서 `AXCheckBox`는
+`AXDescription`, `AXStaticText`는 `AXValue`를 봐야 한다. `NSOpenPanel`은 모달이라 자동화하면
+세션이 막히므로 건드리지 않는다.
 
 `SMAppService` 등록 상태는 메뉴 항목의 체크마크로 확인한다. `sfltool dumpbtm`은 토글 직후
 응답이 멈추는 일이 있어 신뢰할 수 있는 판정 수단이 아니다.

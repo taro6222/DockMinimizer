@@ -105,12 +105,13 @@ swift test                   # 순수 로직 24개
 
 swift run DockProbe          # Dock AX 트리 덤프
 swift run DockProbe verify   # 설치된 앱 동작 검증 11개
+swift run DockProbe ui       # 메뉴바·설정 창·로그인 항목 15개
 swift run DockProbe race     # 리슨 전용 탭 회귀 테스트 (앱을 끄고 실행)
 
 log show --predicate 'subsystem == "com.changhun.dockminimizer"' --last 10m --info --debug
 ```
 
-Dock이나 이벤트 탭 코드를 고쳤다면 `verify`와 `race`를 모두 다시 돌릴 것.
+Dock이나 이벤트 탭 코드를 고쳤다면 `verify`와 `race`를, 메뉴바나 설정 창을 고쳤다면 `ui`를 돌릴 것.
 `race`는 위 구조 2번이 여전히 유효한지 확인한다.
 
 ## 문서

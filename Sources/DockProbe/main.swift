@@ -125,6 +125,10 @@ if mode == "verify" {
     exit(runVerification(appName: appName, bundleID: bundleID))
 }
 
+if mode == "ui" {
+    exit(runUIVerification())
+}
+
 if mode == "race" {
     let bundleID = CommandLine.arguments.dropFirst(2).first ?? "com.apple.Notes"
     exit(runRaceCheck(bundleID: bundleID))
