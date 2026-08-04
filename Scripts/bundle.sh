@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 changhun
 # .app 번들을 조립하고 서명한다.
 set -euo pipefail
 

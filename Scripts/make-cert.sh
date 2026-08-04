@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 changhun
 # 재빌드해도 접근성 권한이 유지되도록 고정 self-signed 코드서명 인증서를 만든다.
 # ad-hoc 서명(codesign -s -)은 빌드마다 cdhash가 바뀌어 TCC 권한이 사라진다.
 set -euo pipefail

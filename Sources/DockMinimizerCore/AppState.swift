@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 changhun
+
 import Foundation
 
 /// 판정에 필요한 프론트모스트 앱의 상태. AX 조회 결과를 미리 계산해 담아 둔 값이다.

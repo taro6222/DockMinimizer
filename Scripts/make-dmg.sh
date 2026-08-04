@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 changhun
 # 드래그 설치용 DMG를 만든다. 외부 의존성 없이 hdiutil만 사용한다.
 #
 # 결과물은 자체 서명이므로 다른 Mac에서는 Gatekeeper가 막는다.
@@ -76,6 +78,12 @@ Dock에는 이 앱의 아이콘이 생기지 않습니다 (메뉴바 전용 앱)
   메뉴바에 그 사유가 표시됩니다.
 - 제거하려면 메뉴바에서 종료한 뒤 /Applications/DockMinimizer.app 을 삭제하고,
   손쉬운 사용 목록에서도 지우면 됩니다.
+
+
+라이선스
+--------
+GNU General Public License v3.0 or later.
+소스 코드: https://github.com/<사용자명>/DockMinimizer
 NOTE
 
 echo "==> DMG 생성: $DMG"

@@ -1,4 +1,7 @@
 // swift-tools-version: 6.0
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 changhun
+
 import PackageDescription
 
 let package = Package(

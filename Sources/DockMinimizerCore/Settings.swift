@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 changhun
+
 import Foundation
 
 /// UserDefaults 기반 설정. 읽기는 이벤트 탭 콜백 밖(Coordinator의 캐시 갱신 시점)에서만 하고,

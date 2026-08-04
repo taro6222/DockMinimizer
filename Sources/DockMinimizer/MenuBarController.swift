@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 changhun
+
 import AppKit
 import DockMinimizerCore
 import ServiceManagement

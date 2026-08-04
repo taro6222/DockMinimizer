@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 changhun
 # /Applications 고정 경로에 설치한다.
 # 경로가 바뀌면 접근성 권한이 사라지므로 항상 같은 경로를 쓴다.
 set -euo pipefail
